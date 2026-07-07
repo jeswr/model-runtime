@@ -27,18 +27,36 @@ function hasIriSchemeGuard(field) {
     return field.kind === "iri" && field.guards?.iriScheme === "http-https";
 }
 /**
- * A live set of http(s)-canonical IRIs backed by an @rdfjs/wrapper set. Every
- * boundary is guarded so an IRI field's set can NEVER surface or store a
- * non-http(s) / non-canonical value, regardless of how the underlying RDF was
- * written (design §7.3 — the filter is applied to every IRI field, fail-closed).
- * `add` canonicalises + drops non-http members; iteration / `has` / `size` /
- * `forEach` expose only the canonical http members present in the backing set.
+ * The raw NamedNode object VALUES of `(doc, predicate, *)`, read straight from the
+ * dataset — NOT through a mapper. Non-NamedNode objects (a literal / blank node
+ * planted on an IRI predicate by hostile pod data) are SKIPPED, so a malformed
+ * term can never throw the read (fail-closed); the @rdfjs/wrapper `NamedNodeAs`
+ * mapper would throw on such a term, so the filtered set must not use it for reads.
  */
-function makeIriFilteredSet(base) {
+function rawNamedNodeValues(doc, predicate) {
+    const pred = doc.factory.namedNode(predicate);
+    const out = [];
+    for (const q of doc.dataset.match(doc, pred, null, null)) {
+        if (q.object.termType === "NamedNode")
+            out.push(q.object.value);
+    }
+    return out;
+}
+/**
+ * A live set of http(s)-canonical IRIs over `(doc, predicate)`. Every boundary is
+ * guarded so an IRI field's set can NEVER surface or store a non-http(s) /
+ * non-canonical value, regardless of how the underlying RDF was written (design
+ * §7.3 — the filter is applied to every IRI field, fail-closed). READS go through
+ * {@link rawNamedNodeValues} (no throwing mapper); WRITES go through the vetted
+ * `SetFrom` base (`NamedNodeFrom.string`). `add` canonicalises + drops non-http;
+ * `delete` removes every backing member whose canonical form matches; iteration /
+ * `has` / `size` / `forEach` expose only the canonical http members.
+ */
+function makeIriFilteredSet(doc, predicate, base) {
     const canonicalMembers = () => {
         const out = new Set();
-        for (const m of base) {
-            const c = httpIriOrUndefined(m);
+        for (const raw of rawNamedNodeValues(doc, predicate)) {
+            const c = httpIriOrUndefined(raw);
             if (c !== undefined)
                 out.add(c);
         }
@@ -53,16 +71,24 @@ function makeIriFilteredSet(base) {
         },
         delete(value) {
             const c = httpIriOrUndefined(value);
-            const byCanonical = c !== undefined && base.delete(c);
-            return byCanonical || base.delete(value);
+            if (c === undefined)
+                return false;
+            let deleted = false;
+            // Remove every backing member whose canonical form matches (a non-canonical
+            // equivalent — e.g. `http://x.org` vs `http://x.org/` — is still removed).
+            for (const raw of rawNamedNodeValues(doc, predicate)) {
+                if (httpIriOrUndefined(raw) === c && base.delete(raw))
+                    deleted = true;
+            }
+            return deleted;
         },
         has(value) {
             const c = httpIriOrUndefined(value);
             return c !== undefined && canonicalMembers().has(c);
         },
         clear() {
-            for (const m of [...base])
-                base.delete(m);
+            for (const raw of rawNamedNodeValues(doc, predicate))
+                base.delete(raw);
         },
         forEach(callback, thisArg) {
             for (const v of canonicalMembers())
@@ -103,7 +129,7 @@ function fieldSet(doc, plan) {
     const { field, mapper } = plan;
     const base = SetFrom.subjectPredicate(doc, field.predicate, mapper.as, mapper.from);
     if (hasIriSchemeGuard(field)) {
-        return makeIriFilteredSet(base);
+        return makeIriFilteredSet(doc, field.predicate, base);
     }
     return base;
 }
@@ -193,17 +219,15 @@ function makeEntity(entity, manifest, factory) {
                 const set = fieldSet(doc, plan);
                 const members = Array.isArray(raw) ? raw : [];
                 for (const member of members) {
-                    // IRI-set members are canonicalised + filtered by the filtered set's add.
-                    if (field.kind === "iri") {
-                        set.add(member);
-                        continue;
-                    }
                     let m = member;
                     if (field.guards?.trim && typeof m === "string")
                         m = m.trim();
                     if (field.guards?.dropBlank && (m === "" || m === undefined || m === null))
                         continue;
-                    if (mapper.jsType === "string" &&
+                    // Sanitize LITERAL text members only; IRI members are canonicalised +
+                    // scheme-filtered by the filtered set's add (never sanitized as text).
+                    if (field.kind === "literal" &&
+                        mapper.jsType === "string" &&
                         typeof m === "string" &&
                         field.guards?.sanitizeText !== false) {
                         m = sanitizeText(m);

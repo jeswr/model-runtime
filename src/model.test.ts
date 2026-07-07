@@ -360,4 +360,34 @@ describe("iri set field — scheme guard applies to set members", () => {
     expect((doc as unknown as { links: Set<string> }).links.has("javascript:alert(1)")).toBe(false);
     expect((doc as unknown as { links: Set<string> }).links.has("https://ok.org/a")).toBe(true);
   });
+
+  it("a malformed LITERAL planted on an IRI-set predicate does not throw the read (fail-closed)", () => {
+    // NamedNodeAs.string would throw on a literal; the raw-quad reader must skip it.
+    const store = new Store(
+      new Parser({ baseIRI: Dres }).parse(`
+        @prefix ex: <http://ex.org/> .
+        <${Dsubj}> a ex:Doc ; ex:self <https://a.org/self> ;
+          ex:link <https://ok.org/1> , "not-an-iri" .
+      `),
+    );
+    const doc = new docModel.Wrapper(Dsubj, store, DataFactory);
+    expect([...(doc as unknown as { links: Set<string> }).links]).toEqual(["https://ok.org/1"]);
+    const back = docModel.parse(Dres, store) as { links?: string[] } | undefined;
+    expect(back?.links).toEqual(["https://ok.org/1"]);
+  });
+
+  it("delete removes a member stored in a NON-canonical form", () => {
+    // Store `http://x.org` (no trailing slash); its canonical view is `http://x.org/`.
+    const store = new Store(
+      new Parser({ baseIRI: Dres }).parse(`
+        @prefix ex: <http://ex.org/> .
+        <${Dsubj}> a ex:Doc ; ex:self <https://a.org/self> ; ex:link <http://x.org> .
+      `),
+    );
+    const doc = new docModel.Wrapper(Dsubj, store, DataFactory);
+    const links = (doc as unknown as { links: Set<string> }).links;
+    expect([...links]).toEqual(["http://x.org/"]);
+    expect(links.delete("http://x.org/")).toBe(true);
+    expect([...(doc as unknown as { links: Set<string> }).links]).toEqual([]);
+  });
 });
