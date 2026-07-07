@@ -32,8 +32,11 @@
  * IRI, so a hostile / sloppy input can never land an invalid `NamedNode` with
  * embedded whitespace on the wire.
  */
-export function httpIriOrUndefined(value: string | undefined): string | undefined {
-  if (!value) return undefined;
+export function httpIriOrUndefined(value: unknown): string | undefined {
+  // A non-string is dropped fail-closed: `new URL()` would otherwise STRINGIFY an
+  // object (via its `toString`), so a hostile non-string could be coerced into a
+  // NamedNode. Only a genuine string may become an IRI.
+  if (typeof value !== "string" || value === "") return undefined;
   try {
     const u = new URL(value);
     return u.protocol === "http:" || u.protocol === "https:" ? u.href : undefined;

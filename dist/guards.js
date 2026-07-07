@@ -32,7 +32,10 @@
  * embedded whitespace on the wire.
  */
 export function httpIriOrUndefined(value) {
-    if (!value)
+    // A non-string is dropped fail-closed: `new URL()` would otherwise STRINGIFY an
+    // object (via its `toString`), so a hostile non-string could be coerced into a
+    // NamedNode. Only a genuine string may become an IRI.
+    if (typeof value !== "string" || value === "")
         return undefined;
     try {
         const u = new URL(value);

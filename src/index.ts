@@ -24,6 +24,7 @@ export {
   expandDatatype,
   iriMapper,
   isKnownDatatype,
+  isXsdDuration,
   type JsType,
   literalMapper,
   XSD,

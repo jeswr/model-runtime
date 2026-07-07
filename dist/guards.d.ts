@@ -30,7 +30,7 @@
  * IRI, so a hostile / sloppy input can never land an invalid `NamedNode` with
  * embedded whitespace on the wire.
  */
-export declare function httpIriOrUndefined(value: string | undefined): string | undefined;
+export declare function httpIriOrUndefined(value: unknown): string | undefined;
 /**
  * True for an absolute `http(s)` URL that is ALREADY in its canonical form —
  * i.e. {@link httpIriOrUndefined}`(value) === value`. A narrowing type guard so
