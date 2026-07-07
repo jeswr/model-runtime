@@ -709,21 +709,11 @@ interface NodeRuntime {
 }
 
 /**
- * Bound the graph-walk per nested link when parsing an UNTRUSTED document: a hostile
- * graph could plant thousands of object triples on one link predicate to blow up the
- * walk. We accept the first CONFORMING target within this many candidates (the common
- * case is one), and treat a required link with no conforming target within the bound as
- * unmet (fail-closed). A well-formed document (a single link per predicate) is unaffected.
- */
-const MAX_LINK_CANDIDATES = 32;
-
-/**
- * A global fail-closed budget on sub-node parse ATTEMPTS per composite parse — a hostile
- * document could plant many candidate targets per link across a deep manifest tree, so
- * without a bound the graph-walk's backtracking is worst-case exponential in the tree
- * height. A legitimate document visits O(nodes) sub-nodes; this ceiling is far above any
- * real composite, and exceeding it fails the parse closed (returns undefined) rather than
- * doing unbounded work.
+ * A global fail-closed budget on sub-node parse ATTEMPTS per composite parse — a defensive
+ * backstop against a pathological manifest tree. A single-valued nested link resolves to
+ * at most one target (ambiguity is rejected up-front), so the graph-walk is linear in the
+ * tree; a legitimate document visits O(nodes) sub-nodes. This ceiling is far above any real
+ * composite, and exceeding it fails the parse closed (returns undefined) rather than looping.
  */
 const MAX_NODE_VISITS = 10000;
 
@@ -752,13 +742,19 @@ function makeCompositeEntity(
 
   const subject = (resourceUrl: string): string => nodeIri(rootRt, resourceUrl);
 
-  // Whether any of the node's own OR a descendant node's flat fields is present in
-  // `data` — a node is materialised on build only when it (transitively) carries data,
-  // so an absent optional sub-node leaves no bare typed shell in the document.
+  // Whether a node's subtree carries CONTENT on build — either supplied `data` OR a
+  // build-time default that `writeFlatField` materialises even when the value is absent
+  // (`defaultNow`, `materializeDefault` with a default). A node is materialised only when
+  // its subtree has content, so an absent OPTIONAL sub-node leaves no bare typed shell —
+  // but a node whose fields are wholly DEFAULTED still materialises (matching the flat
+  // build path, so a required defaulted sub-node is never silently omitted).
   const subtreeHasData = (rt: NodeRuntime, data: EntityData): boolean => {
     for (const plan of rt.plans) {
-      const v = data[plan.field.name];
+      const { field } = plan;
+      const v = data[field.name];
       if (v !== undefined && !(Array.isArray(v) && v.length === 0)) return true;
+      if (field.defaultNow) return true;
+      if (field.materializeDefault && field.default !== undefined) return true;
     }
     for (const nf of rt.nested) {
       const child = runtimes.get(nf.node as string);
@@ -806,26 +802,25 @@ function makeCompositeEntity(
         if (!child) continue;
         const required = nf.guards?.requiredFailClosed === true;
         // GRAPH-WALK: follow the ACTUAL link triple to the target subject (never assume
-        // the fragment convention — an untrusted document may link anywhere),
-        // canonicalising each target IRI through the http(s) filter and bounding the
-        // candidate scan. Accept the first CONFORMING sub-node.
-        let childData: EntityData | undefined;
-        let scanned = 0;
+        // the fragment convention — an untrusted document may link anywhere). A nested
+        // link is SINGLE-VALUED (maxCount 1 by construction — set-valued links are a
+        // documented future feature), so collect the DISTINCT canonical http(s) targets
+        // and FAIL CLOSED on ambiguity: MORE THAN ONE distinct target rejects the whole
+        // composite (an untrusted document must not smuggle an extra link target past a
+        // maxCount-1 constraint). A non-http(s) / non-NamedNode object is never a target.
+        const targets = new Set<string>();
         for (const rawTarget of rawNamedNodeValues(doc, nf.predicate)) {
-          if (scanned >= MAX_LINK_CANDIDATES) break;
-          scanned++;
           const target = httpIriOrUndefined(rawTarget);
           if (target === undefined) continue;
-          const parsed = parseNode(child, target);
-          if (parsed !== undefined) {
-            childData = parsed;
-            break;
-          }
+          targets.add(target);
+          if (targets.size > 1) return undefined; // ambiguous single-valued link
         }
+        const [only] = targets; // exactly 0 or 1 distinct target here
+        const childData = only !== undefined ? parseNode(child, only) : undefined;
         if (childData === undefined) {
-          // A Violation-graded (requiredFailClosed) cross-node MUST that no reachable,
-          // conforming sub-node satisfies rejects the WHOLE composite. A Warning/Info
-          // link drops its sub-node's fields and admits.
+          // A Violation-graded (requiredFailClosed) cross-node MUST whose single target
+          // is absent or non-conforming rejects the WHOLE composite. A Warning/Info link
+          // drops its sub-node's fields and admits.
           if (required) return undefined;
           continue;
         }

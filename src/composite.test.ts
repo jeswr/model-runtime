@@ -299,6 +299,110 @@ describe("composite parse — FAIL-CLOSED cross-node MUSTs (untrusted document)"
   });
 });
 
+describe("composite build — a sub-node whose fields are wholly DEFAULTED is materialised", () => {
+  const Ev = "https://ex.org/ev#";
+  const Dctns = "http://purl.org/dc/terms/";
+  const Xsd = "http://www.w3.org/2001/XMLSchema#";
+  const defaultsManifest = {
+    manifestVersion: 1,
+    runtime: { name: "@jeswr/model-runtime", major: 0 },
+    prefixes: { ev: Ev, dct: Dctns, rdf: "http://www.w3.org/1999/02/22-rdf-syntax-ns#", xsd: Xsd },
+    entities: [
+      {
+        name: "Event",
+        kind: "composite" as const,
+        root: "root",
+        nodes: [
+          {
+            name: "root",
+            typeIris: [`${Ev}Event`],
+            fragment: "it",
+            fields: [
+              {
+                name: "label",
+                predicate: `${Ev}label`,
+                kind: "literal" as const,
+                datatype: "xsd:string",
+                maxCount: 1,
+              },
+              {
+                name: "stampLink",
+                predicate: `${Ev}stamp`,
+                kind: "nested" as const,
+                node: "stamp",
+                guards: { requiredFailClosed: true },
+              },
+              {
+                name: "metaLink",
+                predicate: `${Ev}meta`,
+                kind: "nested" as const,
+                node: "meta",
+              },
+            ],
+          },
+          {
+            name: "stamp",
+            typeIris: [`${Ev}Stamp`],
+            fragment: "stamp",
+            // ONLY a defaultNow field — writeFlatField materialises it even when absent.
+            fields: [
+              {
+                name: "createdAt",
+                predicate: `${Dctns}created`,
+                kind: "literal" as const,
+                datatype: "xsd:dateTime",
+                maxCount: 1,
+                defaultNow: true,
+              },
+            ],
+          },
+          {
+            name: "meta",
+            typeIris: [`${Ev}Meta`],
+            fragment: "meta",
+            // ONLY a materializeDefault field.
+            fields: [
+              {
+                name: "version",
+                predicate: `${Ev}version`,
+                kind: "literal" as const,
+                datatype: "xsd:integer",
+                maxCount: 1,
+                default: 1,
+                materializeDefault: true,
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+  const Event = defineModel(defaultsManifest).entities.Event;
+  if (!Event) throw new Error("expected the Event composite");
+  const R = "https://ex.org/e/1";
+
+  it("materialises a REQUIRED defaulted sub-node even when the caller supplies no data for it", () => {
+    // Regression: build data carries ONLY the root's label — the required `stamp`
+    // sub-node's sole field is defaultNow, so it MUST still be written (was omitted when
+    // subtreeHasData ignored defaults, which then made parse reject the whole composite).
+    const store = Event.build(R, { label: "x" });
+    expect(store.getQuads(`${R}#stamp`, RDF_TYPE, `${Ev}Stamp`, null)).toHaveLength(1);
+    expect(store.getQuads(`${R}#stamp`, `${Dctns}created`, null, null)).toHaveLength(1);
+    expect(store.getQuads(`${R}#it`, `${Ev}stamp`, `${R}#stamp`, null)).toHaveLength(1);
+    // …and the whole composite round-trips (the required MUST is met by the default).
+    const parsed = Event.parse(R, store);
+    expect(parsed?.label).toBe("x");
+    expect(parsed?.createdAt).toBeInstanceOf(Date);
+  });
+
+  it("materialises an OPTIONAL sub-node whose only field is a materializeDefault (matches flat build)", () => {
+    const store = Event.build(R, { label: "x" });
+    expect(store.getQuads(`${R}#meta`, RDF_TYPE, `${Ev}Meta`, null)).toHaveLength(1);
+    expect(store.getQuads(`${R}#meta`, `${Ev}version`, null, null)[0]?.object.value).toBe("1");
+    expect(Event.parse(R, store)?.version).toBe(1);
+  });
+});
+
 describe("composite parse — GRAPH-WALK follows the actual link, not the fragment", () => {
   it("follows playedWork to a Track at an ARBITRARY IRI (not #track)", () => {
     const other = "https://alice.pod.example/tracks/xyz#it";
@@ -354,10 +458,10 @@ describe("composite parse — GRAPH-WALK follows the actual link, not the fragme
     expect(Scrobble.parse(RES, store)).toBeUndefined();
   });
 
-  it("bounds the graph-walk against a hostile fan-out of invalid link targets (fail-closed)", () => {
-    // A hostile document planting MANY candidate targets on the required link, none
-    // conforming: the parse stays bounded (MAX_LINK_CANDIDATES + the global budget) and
-    // rejects the whole composite rather than doing unbounded backtracking work.
+  it("stays bounded + fail-closed against a hostile fan-out of link targets (ambiguity reject)", () => {
+    // A hostile document planting MANY distinct targets on the single-valued required
+    // link: the parse rejects the whole composite up-front (>1 distinct target ⇒
+    // ambiguous) and stays fast — it never backtracks across the fan-out.
     const store = new Store();
     store.addQuad(typed(IT, `${MEDIA}PlaybackEvent`));
     store.addQuad(typed(PLAYED_AT, `${TIME}Instant`));
@@ -376,7 +480,6 @@ describe("composite parse — GRAPH-WALK follows the actual link, not the fragme
         DataFactory.namedNode(`${MEDIA}playedWork`),
         DataFactory.namedNode(target),
       );
-      // each candidate is an UNTITLED Track (typed but non-conforming)
       store.addQuad(typed(target, `${MEDIA}Track`));
     }
     const start = Date.now();
@@ -384,7 +487,11 @@ describe("composite parse — GRAPH-WALK follows the actual link, not the fragme
     expect(Date.now() - start).toBeLessThan(2000);
   });
 
-  it("accepts the first CONFORMING target when the link is ambiguous (an extra untitled Track)", () => {
+  it("REJECTS an ambiguous single-valued link (>1 distinct target) fail-closed", () => {
+    // Two distinct playedWork targets — even though one is a perfectly good titled Track,
+    // the extra target violates the maxCount-1 nested link, so the WHOLE composite is
+    // rejected (an untrusted document must not smuggle a second link target). Set-valued
+    // nested links are a documented future feature.
     const bad = "https://alice.pod.example/tracks/bad#it";
     const good = "https://alice.pod.example/tracks/good#it";
     const ttl = `
@@ -396,8 +503,23 @@ describe("composite parse — GRAPH-WALK follows the actual link, not the fragme
       <${good}> a media:Track ; dct:title "Good" .
       <${PLAYED_AT}> a time:Instant ; time:inXSDDateTime "2020-01-01T12:00:00.000Z"^^xsd:dateTime .
     `;
-    const parsed = Scrobble.parse(RES, toStore(ttl));
-    expect(parsed?.trackTitle).toBe("Good");
+    expect(Scrobble.parse(RES, toStore(ttl))).toBeUndefined();
+  });
+
+  it("admits two lexical forms of the SAME canonical link target (not ambiguous)", () => {
+    // The link is written twice with distinct lexical IRIs that CANONICALISE to the same
+    // http(s) target (an explicit :443 is stripped for https), so there is only ONE
+    // distinct canonical target — not ambiguous — and the scrobble round-trips.
+    const alt = "https://alice.pod.example:443/listening/2020-01-01#track";
+    const ttl = `
+      @prefix media: <${MEDIA}> . @prefix core: <${CORE}> .
+      @prefix time: <${TIME}> . @prefix dct: <${DCT}> .
+      @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+      <${IT}> a media:PlaybackEvent ; media:playedWork <${TRACK}>, <${alt}> ; core:atTime <${PLAYED_AT}> .
+      <${TRACK}> a media:Track ; dct:title "Once" .
+      <${PLAYED_AT}> a time:Instant ; time:inXSDDateTime "2020-01-01T12:00:00.000Z"^^xsd:dateTime .
+    `;
+    expect(Scrobble.parse(RES, toStore(ttl))?.trackTitle).toBe("Once");
   });
 });
 
