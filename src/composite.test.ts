@@ -487,6 +487,52 @@ describe("composite parse — GRAPH-WALK follows the actual link, not the fragme
     expect(Date.now() - start).toBeLessThan(2000);
   });
 
+  it("bounds the reads on a NON-http fan-out (no ambiguity trigger) via the read budget", () => {
+    // A hostile document plants a huge fan-out of NON-http objects on the required link:
+    // none is a valid target, so the ambiguity check never fires — only the per-link READ
+    // BUDGET stops the scan. The composite is rejected fail-closed WITHOUT scanning the
+    // whole fan-out (the resolver streams and abandons after the budget). Uses a Store spy
+    // to assert the object reads stay bounded (never the full 100000).
+    const store = new Store();
+    store.addQuad(typed(IT, `${MEDIA}PlaybackEvent`));
+    store.addQuad(typed(PLAYED_AT, `${TIME}Instant`));
+    store.addQuad(
+      DataFactory.namedNode(PLAYED_AT),
+      DataFactory.namedNode(`${TIME}inXSDDateTime`),
+      DataFactory.literal(
+        "2020-01-01T12:00:00.000Z",
+        DataFactory.namedNode("http://www.w3.org/2001/XMLSchema#dateTime"),
+      ),
+    );
+    const Fanout = 100000;
+    for (let i = 0; i < Fanout; i++) {
+      store.addQuad(
+        DataFactory.namedNode(IT),
+        DataFactory.namedNode(`${MEDIA}playedWork`),
+        DataFactory.namedNode(`urn:evil:${i}`), // NON-http ⇒ skipped, never a target
+      );
+    }
+    // Spy on the lazy read path: count how many objects the resolver actually pulls.
+    const s = store as unknown as {
+      readQuads: (...a: unknown[]) => Iterable<unknown>;
+    };
+    const realReadQuads = s.readQuads.bind(store);
+    let objectsRead = 0;
+    s.readQuads = function* spy(...args: unknown[]) {
+      for (const q of realReadQuads(...args)) {
+        objectsRead++;
+        yield q;
+      }
+    } as never;
+    try {
+      expect(Scrobble.parse(RES, store)).toBeUndefined();
+    } finally {
+      s.readQuads = realReadQuads as never;
+    }
+    // The resolver stopped after the read budget (a small constant), NOT the full fan-out.
+    expect(objectsRead).toBeLessThan(1000);
+  });
+
   it("REJECTS an ambiguous single-valued link (>1 distinct target) fail-closed", () => {
     // Two distinct playedWork targets — even though one is a perfectly good titled Track,
     // the extra target violates the maxCount-1 nested link, so the WHOLE composite is

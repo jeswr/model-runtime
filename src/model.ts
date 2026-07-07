@@ -193,6 +193,26 @@ function rawNamedNodeValues(doc: TermWrapper, predicate: string): string[] {
 }
 
 /**
+ * Lazily yield the OBJECT terms of `(subject, predicate, *)` WITHOUT materialising the
+ * full match — so a caller can stop early after a bounded number of reads. Prefers n3's
+ * lazy `readQuads` generator (which yields on demand and can be abandoned mid-stream);
+ * falls back to the RDF/JS `DatasetCore.match` for a non-n3 dataset (correct, if eager).
+ * This is the streaming primitive the bounded single-link resolver relies on.
+ */
+function* matchObjects(dataset: DatasetCore, subject: Term, predicate: Term): Generator<Term> {
+  const lazy = (
+    dataset as unknown as {
+      readQuads?: (s: Term, p: Term, o: Term | null, g: Term | null) => Iterable<{ object: Term }>;
+    }
+  ).readQuads;
+  if (typeof lazy === "function") {
+    for (const q of lazy.call(dataset, subject, predicate, null, null)) yield q.object;
+    return;
+  }
+  for (const q of dataset.match(subject, predicate, null, null)) yield q.object;
+}
+
+/**
  * A live set of http(s)-canonical IRIs over `(doc, predicate)`. Every boundary is
  * guarded so an IRI field's set can NEVER surface or store a non-http(s) /
  * non-canonical value, regardless of how the underlying RDF was written (design
@@ -717,6 +737,46 @@ interface NodeRuntime {
  */
 const MAX_NODE_VISITS = 10000;
 
+/**
+ * A per-link READ budget — the number of raw object terms the single-link resolver will
+ * examine on one predicate before failing closed. A legitimate maxCount-1 link has one
+ * object; this bound stops a hostile document from forcing a large scan/allocation with a
+ * fan-out of duplicate / non-http / distinct objects on one predicate (the streaming
+ * resolver stops at the second distinct target or this many reads, whichever comes first).
+ */
+const MAX_LINK_READS = 32;
+
+interface NestedTargetResolution {
+  /** Fail closed — the link is ambiguous (>1 distinct target) or exceeds the read budget. */
+  readonly reject: boolean;
+  /** The single canonical http(s) target, when resolved and unambiguous (else undefined). */
+  readonly target?: string;
+}
+
+/**
+ * Resolve the SINGLE target of a `nested` (maxCount-1) link FAIL-CLOSED, streaming the raw
+ * object terms with EARLY exit — never materialising the full candidate list. A non-http(s)
+ * / non-NamedNode object is skipped (never a link target); the instant a SECOND distinct
+ * canonical http(s) target is seen the link is rejected as AMBIGUOUS; and if the raw object
+ * reads exceed {@link MAX_LINK_READS} before resolving, the link is rejected (a hostile
+ * fan-out on one predicate must not force unbounded work). Two lexical forms of the SAME
+ * canonical target are NOT ambiguous (they resolve to one target).
+ */
+function resolveNestedTarget(doc: TermWrapper, predicate: string): NestedTargetResolution {
+  const pred = doc.factory.namedNode(predicate);
+  let target: string | undefined;
+  let reads = 0;
+  for (const object of matchObjects(doc.dataset, doc as unknown as Term, pred)) {
+    if (++reads > MAX_LINK_READS) return { reject: true };
+    if (object.termType !== "NamedNode") continue;
+    const canon = httpIriOrUndefined(object.value);
+    if (canon === undefined) continue;
+    if (target === undefined) target = canon;
+    else if (canon !== target) return { reject: true };
+  }
+  return { reject: false, target };
+}
+
 function makeCompositeEntity(
   entity: CompositeManifestEntity,
   manifest: ModelManifest,
@@ -804,19 +864,12 @@ function makeCompositeEntity(
         // GRAPH-WALK: follow the ACTUAL link triple to the target subject (never assume
         // the fragment convention — an untrusted document may link anywhere). A nested
         // link is SINGLE-VALUED (maxCount 1 by construction — set-valued links are a
-        // documented future feature), so collect the DISTINCT canonical http(s) targets
-        // and FAIL CLOSED on ambiguity: MORE THAN ONE distinct target rejects the whole
-        // composite (an untrusted document must not smuggle an extra link target past a
-        // maxCount-1 constraint). A non-http(s) / non-NamedNode object is never a target.
-        const targets = new Set<string>();
-        for (const rawTarget of rawNamedNodeValues(doc, nf.predicate)) {
-          const target = httpIriOrUndefined(rawTarget);
-          if (target === undefined) continue;
-          targets.add(target);
-          if (targets.size > 1) return undefined; // ambiguous single-valued link
-        }
-        const [only] = targets; // exactly 0 or 1 distinct target here
-        const childData = only !== undefined ? parseNode(child, only) : undefined;
+        // documented future feature); the bounded resolver streams the objects and FAILS
+        // CLOSED on ambiguity (>1 distinct target) OR an over-budget fan-out, without
+        // materialising the full candidate list. Either rejects the WHOLE composite.
+        const link = resolveNestedTarget(doc, nf.predicate);
+        if (link.reject) return undefined;
+        const childData = link.target !== undefined ? parseNode(child, link.target) : undefined;
         if (childData === undefined) {
           // A Violation-graded (requiredFailClosed) cross-node MUST whose single target
           // is absent or non-conforming rejects the WHOLE composite. A Warning/Info link
