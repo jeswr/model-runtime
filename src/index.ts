@@ -37,11 +37,15 @@ export {
 } from "./guards.js";
 
 export {
+  type AnyManifestEntity,
+  type CompositeManifestEntity,
+  isCompositeEntity,
   MANIFEST_VERSION,
   type ManifestEntity,
   ManifestError,
   type ManifestField,
   type ManifestFieldGuards,
+  type ManifestNode,
   type ManifestScalar,
   type ModelManifest,
   RUNTIME_MAJOR,

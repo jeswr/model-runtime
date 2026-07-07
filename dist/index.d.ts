@@ -19,6 +19,6 @@
  */
 export { type DatatypeMapper, expandDatatype, iriMapper, isKnownDatatype, isXsdDuration, type JsType, literalMapper, XSD, } from "./datatypes.js";
 export { httpIriOrUndefined, isHttpIri, sanitizeText, tryRead, } from "./guards.js";
-export { MANIFEST_VERSION, type ManifestEntity, ManifestError, type ManifestField, type ManifestFieldGuards, type ManifestScalar, type ModelManifest, RUNTIME_MAJOR, validateManifest, } from "./manifest.js";
+export { type AnyManifestEntity, type CompositeManifestEntity, isCompositeEntity, MANIFEST_VERSION, type ManifestEntity, ManifestError, type ManifestField, type ManifestFieldGuards, type ManifestNode, type ManifestScalar, type ModelManifest, RUNTIME_MAJOR, validateManifest, } from "./manifest.js";
 export { type DefineModelOptions, defineModel, type EntityData, type EntityWrapper, type EntityWrapperConstructor, type Model, type ModelEntity, } from "./model.js";
 //# sourceMappingURL=index.d.ts.map

@@ -55,6 +55,45 @@ The manifest schema (`ModelManifest`) and `validateManifest` are exported for th
 tooling. The IRI filters (`httpIriOrUndefined`, `isHttpIri`, `sanitizeText`, `tryRead`) are exported so
 consumers migrating off a hand-written package keep the exact filter behaviour.
 
+## Composite (document-projection) entities
+
+A `kind: "composite"` entity models ONE flat object projected across SEVERAL connected RDF nodes of
+one document — the shape the hand-written multi-node models (e.g. `@jeswr/solid-listening`'s
+`ScrobbleData`, five nodes: a `media:PlaybackEvent #it` → a `media:Track #track` → `#artist`/`#album`,
+plus a `time:Instant #playedAt`) carry. A composite is a **tree** of nodes: a `root` plus one sub-node
+per `nested` link field. Each node has its own `rdf:type`(s), document `fragment`, and flat field set;
+field names are **globally unique** across the composite (the projection is one object).
+
+```jsonc
+{
+  "name": "Scrobble", "kind": "composite", "root": "event",
+  "nodes": [
+    { "name": "event", "typeIris": ["…#PlaybackEvent"], "fragment": "it", "fields": [
+      { "name": "msPlayed", "predicate": "…#msPlayed", "kind": "literal", "datatype": "xsd:integer" },
+      { "name": "playedWork", "predicate": "…#playedWork", "kind": "nested", "node": "track",
+        "guards": { "requiredFailClosed": true } }        // a Violation-graded cross-node MUST
+    ]},
+    { "name": "track", "typeIris": ["…#Track"], "fragment": "track", "fields": [
+      { "name": "trackTitle", "predicate": "dct:title", "kind": "literal", "datatype": "xsd:string",
+        "guards": { "requiredFailClosed": true, "nonBlank": true } } ]}
+  ]
+}
+```
+
+- **`build`** writes every node at `${resourceUrl}#${fragment}` and links them (an optional sub-node
+  is materialised only when its subtree carries data — no bare typed shells).
+- **`parse`** GRAPH-WALKS from the root: it follows the ACTUAL link triple (never assumes the fragment
+  — an untrusted document may link anywhere), canonicalising each target IRI through the http(s) filter
+  and bounding the candidate scan. A sub-node must carry its `rdf:type` (fail-closed). A
+  `requiredFailClosed` cross-node link whose target sub-node does not conform **rejects the WHOLE
+  composite** (a titled `Track` + a valid `Instant` MUST be reachable); a Warning/Info link simply drops
+  its sub-node's fields and admits. Field names being globally unique, the sub-nodes' fields merge into
+  one flat object.
+
+The composite manifest is validated **fail-closed** (the tree invariant — one root, every non-root node
+exactly one incoming link, acyclic + spanning; a `nested` field carries no data-shape key and only the
+`requiredFailClosed` guard; composite documents are http(s)-scoped, matching the suite IRI discipline).
+
 ## Install (GitHub, no build step)
 
 `dist/` is committed, so the package installs and imports under `ignore-scripts=true` with no build:

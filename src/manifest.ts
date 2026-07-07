@@ -26,7 +26,12 @@ const CAP = {
   prefixes: 256,
   string_len: 4096,
   in_values: 1024,
-  default_object_depth: 8,
+  // A composite manifest nests two levels deeper than a flat one
+  // (entities → nodes → fields → guards → value), so this bounds that shape with
+  // headroom while staying a small recursion-bomb guard.
+  default_object_depth: 10,
+  /** Nodes per composite entity (root + sub-nodes). */
+  nodes_per_composite: 64,
 } as const;
 
 /** Per-field guard flags — all pure data (enums / booleans), no computation. */
@@ -63,8 +68,18 @@ export interface ManifestField {
   name: string;
   /** The full predicate IRI. */
   predicate: string;
-  /** The RDF term kind of the value. */
-  kind: "iri" | "literal";
+  /**
+   * The RDF term kind of the value. `iri` / `literal` are FLAT (single-node) fields;
+   * `nested` is a COMPOSITE structural link — a single-valued object-property edge from
+   * this node to a named sub-node (see {@link ManifestField.node}). A `nested` field
+   * carries NO data value in the flat projection; it only drives the graph-walk (build
+   * writes the link triple to the sub-node's fragment IRI; parse follows it, enforcing
+   * the sub-node's own guards). It may carry only `requiredFailClosed` (the cross-node
+   * MUST) — never a datatype / collection / enum / default.
+   */
+  kind: "iri" | "literal" | "nested";
+  /** For a `nested` field: the name of the target sub-node within the composite. */
+  node?: string;
   /** Present ⇒ the field is a live set; absent ⇒ a single value. */
   collection?: "set";
   /** Datatype IRI (or `xsd:` shorthand) — required for a literal field. */
@@ -85,6 +100,8 @@ export interface ManifestField {
 export interface ManifestEntity {
   /** The entity name (also the generated Wrapper / TS type base name). */
   name: string;
+  /** Discriminator — a FLAT (single-node) entity. Absent is treated as `"flat"`. */
+  kind?: "flat";
   /** The `rdf:type` IRI(s) this entity is stamped with / recognised by. */
   typeIris: string[];
   /** Subject convention: `hash-it` ⇒ `${resourceUrl}#it`; `self` ⇒ `resourceUrl`. */
@@ -92,11 +109,57 @@ export interface ManifestEntity {
   fields: ManifestField[];
 }
 
+/**
+ * One node of a COMPOSITE (document-projection) entity — a mini single-node with its
+ * own `rdf:type`(s), document fragment, and flat + nested field set. The node's IRI in
+ * a document at `resourceUrl` is `${resourceUrl}#${fragment}`. A composite is a TREE of
+ * these: the root plus one sub-node per `nested` link (each non-root node has exactly
+ * one incoming link; the graph is acyclic and spans every node).
+ */
+export interface ManifestNode {
+  /** The node name — unique within the composite; referenced by `nested` fields. */
+  name: string;
+  /** The `rdf:type` IRI(s) this node is stamped with / recognised by. */
+  typeIris: string[];
+  /** The document fragment (e.g. `it`, `track`) — the node IRI is `${resourceUrl}#${fragment}`. */
+  fragment: string;
+  /** The node's flat (`iri`/`literal`) fields plus its outgoing `nested` link fields. */
+  fields: ManifestField[];
+}
+
+/**
+ * A COMPOSITE (document-projection) entity — a ROOT node plus named SUB-NODES, all
+ * written into ONE document at conventional fragment IRIs and projected as ONE flat
+ * object (field names are globally unique across the nodes). `build` writes every node
+ * and links them; `parse` GRAPH-WALKS from the root, enforcing each sub-node's
+ * fail-closed guards — a Violation-graded (`requiredFailClosed`) cross-node link whose
+ * target sub-node does not conform rejects the WHOLE composite (the security-critical
+ * untrusted-document validation the hand-written multi-node models carry).
+ */
+export interface CompositeManifestEntity {
+  /** The entity name (also the generated Wrapper / TS type base name). */
+  name: string;
+  /** Discriminator — a composite (multi-node) entity. */
+  kind: "composite";
+  /** The name of the ROOT node (the build / parse entry point) — must be in `nodes`. */
+  root: string;
+  /** The nodes of the composite (the root plus its sub-nodes). */
+  nodes: ManifestNode[];
+}
+
+/** A manifest entity — a flat single-node entity or a composite document projection. */
+export type AnyManifestEntity = ManifestEntity | CompositeManifestEntity;
+
+/** Type guard — narrows an entity to the composite (document-projection) variant. */
+export function isCompositeEntity(entity: AnyManifestEntity): entity is CompositeManifestEntity {
+  return (entity as { kind?: string }).kind === "composite";
+}
+
 export interface ModelManifest {
   manifestVersion: typeof MANIFEST_VERSION;
   runtime: { name: string; major: number };
   prefixes: Record<string, string>;
-  entities: ManifestEntity[];
+  entities: AnyManifestEntity[];
 }
 
 /** Thrown when a manifest fails the fail-closed validation. */
@@ -183,6 +246,7 @@ const FIELD_KEYS = new Set<string>([
   "name",
   "predicate",
   "kind",
+  "node",
   "collection",
   "datatype",
   "minCount",
@@ -193,7 +257,9 @@ const FIELD_KEYS = new Set<string>([
   "in",
   "guards",
 ]);
-const ENTITY_KEYS = new Set<string>(["name", "typeIris", "subject", "fields"]);
+const ENTITY_KEYS = new Set<string>(["name", "kind", "typeIris", "subject", "fields"]);
+const COMPOSITE_ENTITY_KEYS = new Set<string>(["name", "kind", "root", "nodes"]);
+const NODE_KEYS = new Set<string>(["name", "typeIris", "fragment", "fields"]);
 const ROOT_KEYS = new Set<string>(["manifestVersion", "runtime", "prefixes", "entities"]);
 
 function isObject(v: unknown): v is Record<string, unknown> {
@@ -256,7 +322,52 @@ function validateGuards(raw: unknown): ManifestFieldGuards {
   return g;
 }
 
-function validateField(raw: unknown, seenNames: Set<string>): ManifestField {
+/**
+ * A `nested` field is a COMPOSITE structural link — pure structure, never data. It
+ * carries a target sub-node reference (`node`) and a predicate, and MAY carry only the
+ * `requiredFailClosed` guard (the cross-node MUST). It must NOT carry any data-shape key
+ * (datatype / collection / minCount / maxCount / default / defaultNow /
+ * materializeDefault / in) nor any guard other than `requiredFailClosed` — those would
+ * be silently ignored, so they fail closed here.
+ */
+function validateNestedField(
+  raw: Record<string, unknown>,
+  name: string,
+  predicate: string,
+): ManifestField {
+  const node = checkString(raw.node, "field.node (required for a nested field)");
+  if (!NAME_RE.test(node)) fail(`field.node "${node}" is not a valid node name`);
+  for (const forbidden of [
+    "datatype",
+    "collection",
+    "minCount",
+    "maxCount",
+    "default",
+    "defaultNow",
+    "materializeDefault",
+    "in",
+  ] as const) {
+    if (raw[forbidden] !== undefined) {
+      fail(`field.${forbidden} is not allowed on a nested field`);
+    }
+  }
+  const field: ManifestField = { name, predicate, kind: "nested", node };
+  if (raw.guards !== undefined) {
+    if (!isObject(raw.guards)) fail("field.guards must be an object");
+    assertKnownKeys(raw.guards, new Set(["requiredFailClosed"]), "nested field.guards");
+    if (raw.guards.requiredFailClosed !== undefined) {
+      field.guards = {
+        requiredFailClosed: checkBoolean(
+          raw.guards.requiredFailClosed,
+          "field.guards.requiredFailClosed",
+        ),
+      };
+    }
+  }
+  return field;
+}
+
+function validateField(raw: unknown, seenNames: Set<string>, allowNested = false): ManifestField {
   if (!isObject(raw)) fail("field must be an object");
   assertKnownKeys(raw, FIELD_KEYS, "field");
 
@@ -268,7 +379,14 @@ function validateField(raw: unknown, seenNames: Set<string>): ManifestField {
 
   const predicate = checkString(raw.predicate, "field.predicate");
 
-  if (raw.kind !== "iri" && raw.kind !== "literal") fail('field.kind must be "iri" or "literal"');
+  if (raw.kind === "nested") {
+    if (!allowNested) fail('field.kind "nested" is only allowed inside a composite entity');
+    return validateNestedField(raw, name, predicate);
+  }
+  if (raw.node !== undefined) fail("field.node is only allowed on a nested field");
+  if (raw.kind !== "iri" && raw.kind !== "literal") {
+    fail('field.kind must be "iri", "literal", or "nested"');
+  }
   const kind = raw.kind;
 
   let collection: "set" | undefined;
@@ -317,19 +435,23 @@ function validateField(raw: unknown, seenNames: Set<string>): ManifestField {
   return field;
 }
 
-function validateEntity(raw: unknown): ManifestEntity {
-  if (!isObject(raw)) fail("entity must be an object");
+/** Validate a non-empty, capped, control-char-free array of type IRIs. */
+function validateTypeIris(raw: unknown, what: string): string[] {
+  if (!Array.isArray(raw) || raw.length === 0) fail(`${what} must be a non-empty array`);
+  if (raw.length > CAP.type_iris_per_entity) {
+    fail(`${what} exceeds the ${CAP.type_iris_per_entity} cap`);
+  }
+  return raw.map((t, i) => checkString(t, `${what}[${i}]`));
+}
+
+function validateEntity(raw: Record<string, unknown>): ManifestEntity {
   assertKnownKeys(raw, ENTITY_KEYS, "entity");
+  if (raw.kind !== undefined && raw.kind !== "flat") {
+    fail('entity.kind must be "flat" or "composite"');
+  }
 
   const name = checkString(raw.name, "entity.name");
-
-  if (!Array.isArray(raw.typeIris) || raw.typeIris.length === 0) {
-    fail("entity.typeIris must be a non-empty array");
-  }
-  if (raw.typeIris.length > CAP.type_iris_per_entity) {
-    fail(`entity.typeIris exceeds the ${CAP.type_iris_per_entity} cap`);
-  }
-  const typeIris = raw.typeIris.map((t, i) => checkString(t, `entity.typeIris[${i}]`));
+  const typeIris = validateTypeIris(raw.typeIris, "entity.typeIris");
 
   if (!isObject(raw.subject)) fail("entity.subject must be an object");
   assertKnownKeys(raw.subject, new Set(["convention"]), "entity.subject");
@@ -345,7 +467,122 @@ function validateEntity(raw: unknown): ManifestEntity {
   const seenNames = new Set<string>();
   const fields = raw.fields.map((f) => validateField(f, seenNames));
 
+  // A flat entity carries no `kind` key (byte-compatible with existing manifests).
   return { name, typeIris, subject: { convention }, fields };
+}
+
+// A document fragment must be a bare fragment (no `#` / `/` / whitespace) so the node
+// IRI `${resourceUrl}#${fragment}` is a single, well-formed fragment identifier.
+const FRAGMENT_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/;
+
+function validateNode(raw: unknown, seenFieldNames: Set<string>): ManifestNode {
+  if (!isObject(raw)) fail("composite node must be an object");
+  assertKnownKeys(raw, NODE_KEYS, "composite node");
+
+  const name = checkString(raw.name, "node.name");
+  if (!NAME_RE.test(name)) fail(`node.name "${name}" is not a valid node name`);
+
+  const typeIris = validateTypeIris(raw.typeIris, "node.typeIris");
+
+  const fragment = checkString(raw.fragment, "node.fragment");
+  if (!FRAGMENT_RE.test(fragment)) fail(`node.fragment "${fragment}" is not a valid fragment`);
+
+  if (!Array.isArray(raw.fields)) fail("node.fields must be an array");
+  if (raw.fields.length > CAP.fields_per_entity) {
+    fail(`node.fields exceeds the ${CAP.fields_per_entity} cap`);
+  }
+  // Field names are GLOBALLY unique across the composite (the flat projection is one
+  // object), so the seen-set is shared across all the composite's nodes.
+  const fields = raw.fields.map((f) => validateField(f, seenFieldNames, /* allowNested */ true));
+
+  return { name, typeIris, fragment, fields };
+}
+
+/**
+ * Validate a composite (document-projection) entity FAIL-CLOSED and assert its TREE
+ * invariant: exactly one root (named by `root`); every non-root node has EXACTLY ONE
+ * incoming `nested` link; every `nested` link targets a declared node; the link graph
+ * is acyclic and spans every node (reachable from the root). A cycle, an orphan node, a
+ * dangling link target, or a link INTO the root fails closed.
+ */
+function validateCompositeEntity(raw: Record<string, unknown>): CompositeManifestEntity {
+  assertKnownKeys(raw, COMPOSITE_ENTITY_KEYS, "composite entity");
+  const name = checkString(raw.name, "entity.name");
+  const root = checkString(raw.root, "entity.root");
+
+  if (!Array.isArray(raw.nodes) || raw.nodes.length === 0) {
+    fail("composite entity.nodes must be a non-empty array");
+  }
+  if (raw.nodes.length > CAP.nodes_per_composite) {
+    fail(`composite entity.nodes exceeds the ${CAP.nodes_per_composite} cap`);
+  }
+
+  const seenNodeNames = new Set<string>();
+  const seenFragments = new Set<string>();
+  const seenFieldNames = new Set<string>();
+  const nodes = (raw.nodes as unknown[]).map((n) => {
+    const node = validateNode(n, seenFieldNames);
+    if (seenNodeNames.has(node.name)) fail(`duplicate composite node name "${node.name}"`);
+    seenNodeNames.add(node.name);
+    if (seenFragments.has(node.fragment)) {
+      fail(`duplicate composite node fragment "${node.fragment}"`);
+    }
+    seenFragments.add(node.fragment);
+    return node;
+  });
+
+  if (!seenNodeNames.has(root)) fail(`composite entity.root "${root}" is not a declared node`);
+
+  // Build the nested-link parent map and assert the TREE invariant.
+  const parentOf = new Map<string, string>(); // child node name → the node that links to it
+  for (const node of nodes) {
+    for (const field of node.fields) {
+      if (field.kind !== "nested") continue;
+      const target = field.node as string;
+      if (!seenNodeNames.has(target)) {
+        fail(`composite nested field "${field.name}" targets unknown node "${target}"`);
+      }
+      if (target === root) fail(`composite nested field "${field.name}" links into the root node`);
+      if (target === node.name)
+        fail(`composite nested field "${field.name}" links a node to itself`);
+      if (parentOf.has(target)) {
+        fail(`composite node "${target}" has more than one incoming nested link (not a tree)`);
+      }
+      parentOf.set(target, node.name);
+    }
+  }
+  // Every non-root node must have exactly one parent; the root must have none.
+  for (const node of nodes) {
+    if (node.name === root) continue;
+    if (!parentOf.has(node.name)) {
+      fail(`composite node "${node.name}" is unreachable (no incoming nested link)`);
+    }
+  }
+  // Reachability from the root (also rejects a cycle among non-root nodes, which the
+  // one-parent rule alone would leave disconnected from the root).
+  const byName = new Map(nodes.map((n) => [n.name, n]));
+  const reached = new Set<string>();
+  const stack = [root];
+  while (stack.length > 0) {
+    const current = stack.pop() as string;
+    if (reached.has(current)) continue;
+    reached.add(current);
+    const node = byName.get(current);
+    if (!node) continue;
+    for (const field of node.fields) {
+      if (field.kind === "nested" && field.node !== undefined) stack.push(field.node);
+    }
+  }
+  if (reached.size !== nodes.length) {
+    fail("composite link graph is not a tree spanning every node (a cycle or orphan)");
+  }
+
+  return { name, kind: "composite", root, nodes };
+}
+
+function validateEntityAny(raw: unknown): AnyManifestEntity {
+  if (!isObject(raw)) fail("entity must be an object");
+  return raw.kind === "composite" ? validateCompositeEntity(raw) : validateEntity(raw);
 }
 
 /**
@@ -390,7 +627,7 @@ export function validateManifest(input: unknown): ModelManifest {
     fail(`manifest.entities exceeds the ${CAP.entities} cap`);
   const seenEntityNames = new Set<string>();
   const entities = input.entities.map((e) => {
-    const entity = validateEntity(e);
+    const entity = validateEntityAny(e);
     if (seenEntityNames.has(entity.name)) fail(`duplicate entity.name "${entity.name}"`);
     seenEntityNames.add(entity.name);
     return entity;
