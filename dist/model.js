@@ -22,11 +22,76 @@ function planField(field) {
     const mapper = field.kind === "iri" ? iriMapper() : literalMapper(field.datatype);
     return { field, mapper };
 }
+/** Whether a field is an IRI field carrying the http(s)-only scheme guard. */
+function hasIriSchemeGuard(field) {
+    return field.kind === "iri" && field.guards?.iriScheme === "http-https";
+}
+/**
+ * A live set of http(s)-canonical IRIs backed by an @rdfjs/wrapper set. Every
+ * boundary is guarded so an IRI field's set can NEVER surface or store a
+ * non-http(s) / non-canonical value, regardless of how the underlying RDF was
+ * written (design §7.3 — the filter is applied to every IRI field, fail-closed).
+ * `add` canonicalises + drops non-http members; iteration / `has` / `size` /
+ * `forEach` expose only the canonical http members present in the backing set.
+ */
+function makeIriFilteredSet(base) {
+    const canonicalMembers = () => {
+        const out = new Set();
+        for (const m of base) {
+            const c = httpIriOrUndefined(m);
+            if (c !== undefined)
+                out.add(c);
+        }
+        return out;
+    };
+    const filtered = {
+        add(value) {
+            const c = httpIriOrUndefined(value);
+            if (c !== undefined)
+                base.add(c);
+            return filtered;
+        },
+        delete(value) {
+            const c = httpIriOrUndefined(value);
+            const byCanonical = c !== undefined && base.delete(c);
+            return byCanonical || base.delete(value);
+        },
+        has(value) {
+            const c = httpIriOrUndefined(value);
+            return c !== undefined && canonicalMembers().has(c);
+        },
+        clear() {
+            for (const m of [...base])
+                base.delete(m);
+        },
+        forEach(callback, thisArg) {
+            for (const v of canonicalMembers())
+                callback.call(thisArg, v, v, filtered);
+        },
+        keys() {
+            return canonicalMembers().keys();
+        },
+        values() {
+            return canonicalMembers().values();
+        },
+        entries() {
+            return canonicalMembers().entries();
+        },
+        [Symbol.iterator]() {
+            return canonicalMembers()[Symbol.iterator]();
+        },
+        get size() {
+            return canonicalMembers().size;
+        },
+        [Symbol.toStringTag]: "Set",
+    };
+    return filtered;
+}
 /** Read a single (non-set) field's value, applying read-side guards, fail-closed. */
 function readSingle(doc, plan) {
     const { field, mapper } = plan;
     const raw = tryRead(() => OptionalFrom.subjectPredicate(doc, field.predicate, mapper.as));
-    if (field.kind === "iri" && field.guards?.iriScheme === "http-https") {
+    if (hasIriSchemeGuard(field)) {
         return httpIriOrUndefined(raw);
     }
     if (raw === undefined && field.default !== undefined)
@@ -36,24 +101,33 @@ function readSingle(doc, plan) {
 /** Live set for a set field (mutations write through @rdfjs/wrapper's SetFrom). */
 function fieldSet(doc, plan) {
     const { field, mapper } = plan;
-    return SetFrom.subjectPredicate(doc, field.predicate, mapper.as, mapper.from);
+    const base = SetFrom.subjectPredicate(doc, field.predicate, mapper.as, mapper.from);
+    if (hasIriSchemeGuard(field)) {
+        return makeIriFilteredSet(base);
+    }
+    return base;
 }
-/** Write a single (non-set) field's value, applying write-side guards. */
+/** Write a single (non-set) field's value, applying write-side guards, fail-closed. */
 function writeSingle(doc, plan, value) {
     const { field, mapper } = plan;
     let v = value;
-    if (field.kind === "iri" && field.guards?.iriScheme === "http-https") {
-        v = httpIriOrUndefined(v);
+    if (field.kind === "iri") {
+        if (hasIriSchemeGuard(field))
+            v = httpIriOrUndefined(v);
+        OptionalAs.object(doc, field.predicate, v, NamedNodeFrom.string);
+        return;
     }
-    else if (v !== undefined &&
-        mapper.jsType === "string" &&
-        field.guards?.sanitizeText !== false) {
-        v = sanitizeText(v);
+    // Literal field: sanitize a string value; DROP a non-string value fail-closed
+    // (a mistyped value must never be coerced into garbage or throw the write).
+    if (v !== undefined && mapper.jsType === "string") {
+        v =
+            typeof v === "string"
+                ? field.guards?.sanitizeText === false
+                    ? v
+                    : sanitizeText(v)
+                : undefined;
     }
-    const from = field.kind === "iri"
-        ? NamedNodeFrom.string
-        : mapper.from;
-    OptionalAs.object(doc, field.predicate, v, from);
+    OptionalAs.object(doc, field.predicate, v, mapper.from);
 }
 function subjectIri(convention, resourceUrl) {
     return convention === "hash-it" ? `${resourceUrl}#it` : resourceUrl;
@@ -119,6 +193,11 @@ function makeEntity(entity, manifest, factory) {
                 const set = fieldSet(doc, plan);
                 const members = Array.isArray(raw) ? raw : [];
                 for (const member of members) {
+                    // IRI-set members are canonicalised + filtered by the filtered set's add.
+                    if (field.kind === "iri") {
+                        set.add(member);
+                        continue;
+                    }
                     let m = member;
                     if (field.guards?.trim && typeof m === "string")
                         m = m.trim();
@@ -134,8 +213,9 @@ function makeEntity(entity, manifest, factory) {
                 continue;
             }
             let v = raw;
-            if (field.kind === "literal" && field.guards?.emptyStringDrop)
-                v = v || undefined;
+            // emptyStringDrop drops ONLY an empty string (not a valid falsy 0 / false).
+            if (field.kind === "literal" && field.guards?.emptyStringDrop && v === "")
+                v = undefined;
             if (v === undefined && field.defaultNow)
                 v = new Date();
             if (v === undefined && field.materializeDefault && field.default !== undefined) {

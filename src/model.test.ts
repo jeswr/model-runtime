@@ -278,4 +278,86 @@ describe("typed accessor (Wrapper)", () => {
     // archived reads back as its default false (malformed value dropped).
     expect(back?.archived).toBe(false);
   });
+
+  it("a non-string value on a string field is dropped, not coerced or thrown (fail-closed)", () => {
+    // A caller mistyping title as a number must not throw sanitizeText / write garbage.
+    const store = bm.build(RES, { url: URL_, title: 123 as unknown as string });
+    expect(store.getQuads(SUBJ, "http://purl.org/dc/terms/title", null, null)).toHaveLength(0);
+  });
+});
+
+// The iri-scheme guard must apply to SET fields too (roborev Medium, model.ts:225):
+// an `iri` field with `collection: "set"` and iriScheme filters every member.
+const IRI_SET_MANIFEST = {
+  manifestVersion: 1,
+  runtime: { name: "@jeswr/model-runtime", major: 0 },
+  prefixes: { ex: "http://ex.org/" },
+  entities: [
+    {
+      name: "Doc",
+      typeIris: ["http://ex.org/Doc"],
+      subject: { convention: "hash-it" },
+      fields: [
+        {
+          name: "self",
+          predicate: "http://ex.org/self",
+          kind: "iri",
+          minCount: 1,
+          guards: { iriScheme: "http-https", requiredFailClosed: true },
+        },
+        {
+          name: "links",
+          predicate: "http://ex.org/link",
+          kind: "iri",
+          collection: "set",
+          guards: { iriScheme: "http-https" },
+        },
+      ],
+    },
+  ],
+};
+
+describe("iri set field — scheme guard applies to set members", () => {
+  const docModel = defineModel(IRI_SET_MANIFEST).entities.Doc;
+  if (!docModel) throw new Error("Doc entity missing");
+  const Dres = "http://ex.org/d";
+  const Dsubj = docModel.subject(Dres);
+
+  it("build drops hostile / non-http members, keeps http ones", () => {
+    const store = docModel.build(Dres, {
+      self: "https://a.org/self",
+      links: ["https://a.org/x", "javascript:alert(1)", "http://b.org/y", "data:text/html,x"],
+    });
+    const links = store
+      .getQuads(Dsubj, "http://ex.org/link", null, null)
+      .map((q) => q.object.value);
+    expect(links.sort()).toEqual(["http://b.org/y", "https://a.org/x"]);
+    // Every stored link is a NamedNode.
+    for (const q of store.getQuads(Dsubj, "http://ex.org/link", null, null)) {
+      expect(q.object.termType).toBe("NamedNode");
+    }
+  });
+
+  it("parse drops a hostile link stored by another route (read filter)", () => {
+    const store = new Store(
+      new Parser({ baseIRI: Dres }).parse(`
+        @prefix ex: <http://ex.org/> .
+        <${Dsubj}> a ex:Doc ; ex:self <https://a.org/self> ;
+          ex:link <https://ok.org/1> , <javascript:alert(1)> .
+      `),
+    );
+    const back = docModel.parse(Dres, store) as { links?: string[] } | undefined;
+    expect(back?.links).toEqual(["https://ok.org/1"]);
+  });
+
+  it("the live set accessor filters add / has / iterate", () => {
+    const store = new Store();
+    const doc = new docModel.Wrapper(Dsubj, store, DataFactory).mark();
+    const links = (doc as unknown as { links: Set<string> }).links;
+    links.add("https://ok.org/a");
+    links.add("javascript:alert(1)"); // dropped
+    expect([...(doc as unknown as { links: Set<string> }).links]).toEqual(["https://ok.org/a"]);
+    expect((doc as unknown as { links: Set<string> }).links.has("javascript:alert(1)")).toBe(false);
+    expect((doc as unknown as { links: Set<string> }).links.has("https://ok.org/a")).toBe(true);
+  });
 });
