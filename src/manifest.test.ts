@@ -1,6 +1,6 @@
 // AUTHORED-BY Claude Opus 4.8
 import { describe, expect, it } from "vitest";
-import { ManifestError, validateManifest } from "./manifest.js";
+import { isCompositeEntity, ManifestError, validateManifest } from "./manifest.js";
 
 // Loose, mutable, tuple-typed shapes so a test can index [0] without an
 // undefined check and smuggle an unknown key without a cast (that IS the test).
@@ -43,8 +43,10 @@ describe("validateManifest — accepts a well-formed manifest", () => {
   it("returns a normalized manifest", () => {
     const m = validateManifest(base());
     expect(m.manifestVersion).toBe(1);
-    expect(m.entities[0]?.name).toBe("Bookmark");
-    expect(m.entities[0]?.fields[0]?.kind).toBe("iri");
+    const first = m.entities[0];
+    if (!first || isCompositeEntity(first)) throw new Error("expected a flat Bookmark entity");
+    expect(first.name).toBe("Bookmark");
+    expect(first.fields[0]?.kind).toBe("iri");
   });
 });
 

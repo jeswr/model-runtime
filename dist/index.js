@@ -20,6 +20,6 @@
  */
 export { expandDatatype, iriMapper, isKnownDatatype, isXsdDuration, literalMapper, XSD, } from "./datatypes.js";
 export { httpIriOrUndefined, isHttpIri, sanitizeText, tryRead, } from "./guards.js";
-export { MANIFEST_VERSION, ManifestError, RUNTIME_MAJOR, validateManifest, } from "./manifest.js";
+export { isCompositeEntity, MANIFEST_VERSION, ManifestError, RUNTIME_MAJOR, validateManifest, } from "./manifest.js";
 export { defineModel, } from "./model.js";
 //# sourceMappingURL=index.js.map

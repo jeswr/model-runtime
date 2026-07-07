@@ -46,8 +46,18 @@ export interface ManifestField {
     name: string;
     /** The full predicate IRI. */
     predicate: string;
-    /** The RDF term kind of the value. */
-    kind: "iri" | "literal";
+    /**
+     * The RDF term kind of the value. `iri` / `literal` are FLAT (single-node) fields;
+     * `nested` is a COMPOSITE structural link — a single-valued object-property edge from
+     * this node to a named sub-node (see {@link ManifestField.node}). A `nested` field
+     * carries NO data value in the flat projection; it only drives the graph-walk (build
+     * writes the link triple to the sub-node's fragment IRI; parse follows it, enforcing
+     * the sub-node's own guards). It may carry only `requiredFailClosed` (the cross-node
+     * MUST) — never a datatype / collection / enum / default.
+     */
+    kind: "iri" | "literal" | "nested";
+    /** For a `nested` field: the name of the target sub-node within the composite. */
+    node?: string;
     /** Present ⇒ the field is a live set; absent ⇒ a single value. */
     collection?: "set";
     /** Datatype IRI (or `xsd:` shorthand) — required for a literal field. */
@@ -67,6 +77,8 @@ export interface ManifestField {
 export interface ManifestEntity {
     /** The entity name (also the generated Wrapper / TS type base name). */
     name: string;
+    /** Discriminator — a FLAT (single-node) entity. Absent is treated as `"flat"`. */
+    kind?: "flat";
     /** The `rdf:type` IRI(s) this entity is stamped with / recognised by. */
     typeIris: string[];
     /** Subject convention: `hash-it` ⇒ `${resourceUrl}#it`; `self` ⇒ `resourceUrl`. */
@@ -75,6 +87,46 @@ export interface ManifestEntity {
     };
     fields: ManifestField[];
 }
+/**
+ * One node of a COMPOSITE (document-projection) entity — a mini single-node with its
+ * own `rdf:type`(s), document fragment, and flat + nested field set. The node's IRI in
+ * a document at `resourceUrl` is `${resourceUrl}#${fragment}`. A composite is a TREE of
+ * these: the root plus one sub-node per `nested` link (each non-root node has exactly
+ * one incoming link; the graph is acyclic and spans every node).
+ */
+export interface ManifestNode {
+    /** The node name — unique within the composite; referenced by `nested` fields. */
+    name: string;
+    /** The `rdf:type` IRI(s) this node is stamped with / recognised by. */
+    typeIris: string[];
+    /** The document fragment (e.g. `it`, `track`) — the node IRI is `${resourceUrl}#${fragment}`. */
+    fragment: string;
+    /** The node's flat (`iri`/`literal`) fields plus its outgoing `nested` link fields. */
+    fields: ManifestField[];
+}
+/**
+ * A COMPOSITE (document-projection) entity — a ROOT node plus named SUB-NODES, all
+ * written into ONE document at conventional fragment IRIs and projected as ONE flat
+ * object (field names are globally unique across the nodes). `build` writes every node
+ * and links them; `parse` GRAPH-WALKS from the root, enforcing each sub-node's
+ * fail-closed guards — a Violation-graded (`requiredFailClosed`) cross-node link whose
+ * target sub-node does not conform rejects the WHOLE composite (the security-critical
+ * untrusted-document validation the hand-written multi-node models carry).
+ */
+export interface CompositeManifestEntity {
+    /** The entity name (also the generated Wrapper / TS type base name). */
+    name: string;
+    /** Discriminator — a composite (multi-node) entity. */
+    kind: "composite";
+    /** The name of the ROOT node (the build / parse entry point) — must be in `nodes`. */
+    root: string;
+    /** The nodes of the composite (the root plus its sub-nodes). */
+    nodes: ManifestNode[];
+}
+/** A manifest entity — a flat single-node entity or a composite document projection. */
+export type AnyManifestEntity = ManifestEntity | CompositeManifestEntity;
+/** Type guard — narrows an entity to the composite (document-projection) variant. */
+export declare function isCompositeEntity(entity: AnyManifestEntity): entity is CompositeManifestEntity;
 export interface ModelManifest {
     manifestVersion: typeof MANIFEST_VERSION;
     runtime: {
@@ -82,7 +134,7 @@ export interface ModelManifest {
         major: number;
     };
     prefixes: Record<string, string>;
-    entities: ManifestEntity[];
+    entities: AnyManifestEntity[];
 }
 /** Thrown when a manifest fails the fail-closed validation. */
 export declare class ManifestError extends Error {
