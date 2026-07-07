@@ -1,0 +1,36 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jeswr/full-solid-ecosystem/main/tracking/schema/suite.schema.json",
+  "id": "model-runtime",
+  "kind": "sdk",
+  "name": "Federation Model Runtime",
+  "repo": "https://github.com/jeswr/model-runtime",
+  "category": "infrastructure",
+  "maturity": "alpha",
+  "visibility": "public",
+  "securityCritical": true,
+  "stack": {
+    "lang": "TypeScript (ESM, NodeNext)",
+    "runtime": "Node >=20 / browser-safe core",
+    "rdf": "n3 ^2.x",
+    "rdf-wrapper": "@rdfjs/wrapper ^0.34.x",
+    "fetch-rdf": "@jeswr/fetch-rdf ^0.1",
+    "test": "vitest ^4.x",
+    "lint": "@biomejs/biome ^2.x",
+    "node": ">=20"
+  },
+  "federation": {
+    "sectors": [],
+    "produces": [],
+    "consumes": [],
+    "note": "The ONE audited generic runtime for the federation-codegen pipeline (design rev-3 P0). Interprets a fail-closed-validated JSON shape-manifest to parse / validate / read / write RDF over @rdfjs/wrapper, carrying the full guard inventory the six hand-written @jeswr data-model packages duplicated (http(s)-only lexical IRI filtering, tryRead fail-closed field drops, singleton/default semantics, control-char sanitization on text writes, size/depth caps). Generated model.js/model.json/model.d.ts artifacts carry NO executable logic — all behaviour lives here, audited once. securityCritical: the shared interpreter of federation-sourced schemas for every domain. GitHub-installable now (committed dist/, ignore-scripts=true); npm publish is a deferred migration."
+  },
+  "status": {
+    "version": "0.1.0",
+    "gate": {
+      "lint": "pass",
+      "typecheck": "pass",
+      "test": "pass",
+      "build": "pass"
+    }
+  }
+}

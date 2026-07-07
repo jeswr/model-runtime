@@ -1,0 +1,67 @@
+{
+  "name": "@jeswr/model-runtime",
+  "version": "0.1.0",
+  "description": "The one audited generic runtime for the federation-codegen pipeline — interprets a JSON shape-manifest to parse / validate / read / write RDF over @rdfjs/wrapper, carrying the full guard inventory the hand-written @jeswr data-model packages duplicate. Generated artifacts contain NO executable logic.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Jesse Wright",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jeswr/model-runtime.git"
+  },
+  "homepage": "https://github.com/jeswr/model-runtime#readme",
+  "bugs": {
+    "url": "https://github.com/jeswr/model-runtime/issues"
+  },
+  "keywords": [
+    "solid",
+    "rdf",
+    "shacl",
+    "codegen",
+    "rdfjs",
+    "wrapper",
+    "federation"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "lint": "biome check src scripts",
+    "lint:fix": "biome check --write src scripts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check:dist": "node scripts/check-dist.mjs",
+    "gate": "npm run lint && npm run typecheck && npm run test && npm run build && npm run check:dist"
+  },
+  "dependencies": {
+    "@jeswr/fetch-rdf": "^0.1.0",
+    "@rdfjs/wrapper": "^0.34.0",
+    "n3": "^2.0.3"
+  },
+  "peerDependencies": {
+    "@rdfjs/types": "^2.0.1"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.0.0",
+    "@rdfjs/types": "^2.0.1",
+    "@types/n3": "^1.26.1",
+    "@types/node": "^20",
+    "typescript": "^5",
+    "vitest": "^4.1.8"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
