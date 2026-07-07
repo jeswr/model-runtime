@@ -102,6 +102,10 @@ const GUARD_KEYS = new Set([
     "trim",
     "dropBlank",
     "sortOnRead",
+    "minInclusive",
+    "maxInclusive",
+    "minLength",
+    "nonBlank",
 ]);
 const FIELD_KEYS = new Set([
     "name",
@@ -133,6 +137,11 @@ function checkCount(v, what) {
     }
     return v;
 }
+function checkFiniteNumber(v, what) {
+    if (typeof v !== "number" || !Number.isFinite(v))
+        fail(`${what} must be a finite number`);
+    return v;
+}
 function validateGuards(raw) {
     if (raw === undefined)
         return {};
@@ -157,6 +166,19 @@ function validateGuards(raw) {
         g.dropBlank = checkBoolean(raw.dropBlank, "field.guards.dropBlank");
     if (raw.sortOnRead !== undefined)
         g.sortOnRead = checkBoolean(raw.sortOnRead, "field.guards.sortOnRead");
+    if (raw.minInclusive !== undefined)
+        g.minInclusive = checkFiniteNumber(raw.minInclusive, "field.guards.minInclusive");
+    if (raw.maxInclusive !== undefined)
+        g.maxInclusive = checkFiniteNumber(raw.maxInclusive, "field.guards.maxInclusive");
+    if (g.minInclusive !== undefined &&
+        g.maxInclusive !== undefined &&
+        g.minInclusive > g.maxInclusive) {
+        fail(`field.guards.minInclusive (${g.minInclusive}) exceeds field.guards.maxInclusive (${g.maxInclusive})`);
+    }
+    if (raw.minLength !== undefined)
+        g.minLength = checkCount(raw.minLength, "field.guards.minLength");
+    if (raw.nonBlank !== undefined)
+        g.nonBlank = checkBoolean(raw.nonBlank, "field.guards.nonBlank");
     return g;
 }
 function validateField(raw, seenNames) {

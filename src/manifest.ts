@@ -45,6 +45,14 @@ export interface ManifestFieldGuards {
   dropBlank?: boolean;
   /** `parse` returns a set field's members sorted (stable projection). */
   sortOnRead?: boolean;
+  /** Numeric lower bound (`sh:minInclusive`) — a number value below it is dropped. */
+  minInclusive?: number;
+  /** Numeric upper bound (`sh:maxInclusive`) — a number value above it is dropped. */
+  maxInclusive?: number;
+  /** Minimum string length (`sh:minLength`) — a shorter string value is dropped. */
+  minLength?: number;
+  /** Singleton non-blank string: a blank (whitespace-only / empty) value is dropped. */
+  nonBlank?: boolean;
 }
 
 /** A literal scalar a manifest may carry (default value / `sh:in` member). */
@@ -166,6 +174,10 @@ const GUARD_KEYS = new Set<string>([
   "trim",
   "dropBlank",
   "sortOnRead",
+  "minInclusive",
+  "maxInclusive",
+  "minLength",
+  "nonBlank",
 ]);
 const FIELD_KEYS = new Set<string>([
   "name",
@@ -200,6 +212,11 @@ function checkCount(v: unknown, what: string): number {
   return v;
 }
 
+function checkFiniteNumber(v: unknown, what: string): number {
+  if (typeof v !== "number" || !Number.isFinite(v)) fail(`${what} must be a finite number`);
+  return v;
+}
+
 function validateGuards(raw: unknown): ManifestFieldGuards {
   if (raw === undefined) return {};
   if (!isObject(raw)) fail("field.guards must be an object");
@@ -220,6 +237,22 @@ function validateGuards(raw: unknown): ManifestFieldGuards {
     g.dropBlank = checkBoolean(raw.dropBlank, "field.guards.dropBlank");
   if (raw.sortOnRead !== undefined)
     g.sortOnRead = checkBoolean(raw.sortOnRead, "field.guards.sortOnRead");
+  if (raw.minInclusive !== undefined)
+    g.minInclusive = checkFiniteNumber(raw.minInclusive, "field.guards.minInclusive");
+  if (raw.maxInclusive !== undefined)
+    g.maxInclusive = checkFiniteNumber(raw.maxInclusive, "field.guards.maxInclusive");
+  if (
+    g.minInclusive !== undefined &&
+    g.maxInclusive !== undefined &&
+    g.minInclusive > g.maxInclusive
+  ) {
+    fail(
+      `field.guards.minInclusive (${g.minInclusive}) exceeds field.guards.maxInclusive (${g.maxInclusive})`,
+    );
+  }
+  if (raw.minLength !== undefined)
+    g.minLength = checkCount(raw.minLength, "field.guards.minLength");
+  if (raw.nonBlank !== undefined) g.nonBlank = checkBoolean(raw.nonBlank, "field.guards.nonBlank");
   return g;
 }
 

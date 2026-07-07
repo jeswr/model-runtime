@@ -26,6 +26,74 @@ function planField(field) {
 function hasIriSchemeGuard(field) {
     return field.kind === "iri" && field.guards?.iriScheme === "http-https";
 }
+/** SameValueZero equality (native `Set` semantics: NaN matches NaN; +0 matches -0). */
+function sameValueZero(a, b) {
+    return (a === b ||
+        (typeof a === "number" && typeof b === "number" && Number.isNaN(a) && Number.isNaN(b)));
+}
+/**
+ * Apply the CLOSED, DATA-ONLY value guards (numeric range + string length /
+ * non-blank) fail-closed: a value violating a guard is DROPPED (→ `undefined`),
+ * never coerced. Numbers are gated by `minInclusive`/`maxInclusive`; strings by
+ * `minLength` and the singleton `nonBlank` (whitespace-only) drop. Applied on every
+ * read, write, and set-member boundary regardless of the value's provenance.
+ */
+function applyScalarGuards(field, value) {
+    const g = field.guards;
+    if (g === undefined)
+        return value;
+    if (typeof value === "number") {
+        const hasRange = g.minInclusive !== undefined || g.maxInclusive !== undefined;
+        // NaN is unordered — both comparisons are false, so it would slip a range guard;
+        // reject it explicitly when any range bound is declared (fail-closed).
+        if (hasRange && Number.isNaN(value))
+            return undefined;
+        if (g.minInclusive !== undefined && value < g.minInclusive)
+            return undefined;
+        if (g.maxInclusive !== undefined && value > g.maxInclusive)
+            return undefined;
+    }
+    if (typeof value === "string") {
+        // minLength counts Unicode CODE POINTS (not UTF-16 code units) to match
+        // SHACL/XSD character-length semantics for astral characters.
+        if (g.minLength !== undefined && [...value].length < g.minLength)
+            return undefined;
+        if (g.nonBlank === true && value.trim() === "")
+            return undefined;
+    }
+    return value;
+}
+/**
+ * Drop a value that does not conform to its datatype's narrowed value space, fail-
+ * closed on every read + write + set-member boundary:
+ *   - a NUMERIC field requires a `number` — a non-number (e.g. the STRING `"-1"`) is
+ *     dropped, so it can never be serialized as a typed numeric literal
+ *     (`"-1"^^xsd:positiveInteger`) — then the datatype's value space is enforced by
+ *     its `numericValid` (integer subtypes: safe-integer + sign/range; decimal:
+ *     finite; float/double: any number, incl. the permitted NaN/INF/-INF);
+ *   - a string outside a `lexicalValid` lexical space (e.g. `xsd:duration`) is dropped.
+ */
+function applyDatatypeValidity(mapper, value) {
+    if (value === undefined)
+        return undefined;
+    if (mapper.jsType === "number") {
+        if (typeof value !== "number")
+            return undefined;
+        if (mapper.numericValid && !mapper.numericValid(value))
+            return undefined;
+        return value;
+    }
+    if (mapper.jsType === "string") {
+        // A string-mapped field requires a string — a non-string (e.g. `set.add(123)` on
+        // an xsd:duration set) is dropped fail-closed rather than reaching the serializer.
+        if (typeof value !== "string")
+            return undefined;
+        if (mapper.lexicalValid && !mapper.lexicalValid(value))
+            return undefined;
+        return value;
+    }
+    return value;
+}
 /**
  * The raw NamedNode object VALUES of `(doc, predicate, *)`, read straight from the
  * dataset — NOT through a mapper. Non-NamedNode objects (a literal / blank node
@@ -113,21 +181,184 @@ function makeIriFilteredSet(doc, predicate, base) {
     };
     return filtered;
 }
+/**
+ * Whether a field carries a hard value guard (a datatype lexical / numeric
+ * validator, or a numeric-range / string-length guard) that must be enforced on the
+ * LIVE set's `add` + reads too — not only in the `build` path. The cosmetic
+ * trim/dropBlank/sanitize guards stay build-time (their historical home).
+ */
+function setNeedsValueGuard(field, mapper) {
+    // EVERY numeric field needs the guarded set: applyDatatypeValidity enforces the
+    // finite-number / value-space check on the live `add` for ALL numeric datatypes
+    // (incl. decimal/double/float, which have no numericValid but still must reject a
+    // non-number member), matching the singleton + build-time set write paths.
+    if (mapper.jsType === "number")
+        return true;
+    if (mapper.lexicalValid !== undefined || mapper.numericValid !== undefined)
+        return true;
+    const g = field.guards;
+    return (g !== undefined &&
+        (g.minInclusive !== undefined ||
+            g.maxInclusive !== undefined ||
+            g.minLength !== undefined ||
+            g.nonBlank === true));
+}
+/**
+ * Wrap a live set so every `add` AND every read (iteration / has / size / forEach)
+ * passes through the datatype + scalar guards fail-closed — a direct
+ * `wrapper.field.add("P1W")` (xsd:duration) or `.add(0)` (minInclusive 1) can no
+ * longer land an invalid member, and a pre-existing invalid member in untrusted pod
+ * data is not surfaced on read. COMPOSES over any base set: for an IRI field it
+ * wraps the http(s)-scheme-filtered set (from {@link makeIriFilteredSet}), so an IRI
+ * set carrying both a scheme guard and a scalar guard (e.g. `minLength`) enforces
+ * BOTH. For an IRI field `mapper` is `iriMapper` (no lexical/numeric validator), so
+ * only the scalar guards apply here — the scheme filter is the wrapped base's job.
+ */
+function makeGuardedSet(doc, predicate, base, field, mapper) {
+    const iri = hasIriSchemeGuard(field);
+    const guard = (value) => {
+        // For an IRI-scheme field, CANONICALISE first (strip padding, normalise) so the
+        // scalar guards (e.g. minLength) evaluate the STORED canonical form, not the raw
+        // padded input — otherwise a padded IRI could pass minLength then be stored short.
+        const v = iri ? httpIriOrUndefined(value) : applyDatatypeValidity(mapper, value);
+        return applyScalarGuards(field, v);
+    };
+    // Read members from the RAW dataset, mapping each object term inside `tryRead` so a
+    // malformed member (e.g. a hostile literal on a numeric predicate that would make
+    // the @rdfjs/wrapper mapper throw) is DROPPED fail-closed rather than aborting the
+    // whole read (iteration / size / parse). Only guard-passing members surface, deduped.
+    const validMembers = () => {
+        const out = [];
+        const seen = new Set();
+        const push = (mapped) => {
+            const g = guard(mapped);
+            if (g === undefined)
+                return;
+            const key = String(g);
+            if (seen.has(key))
+                return;
+            seen.add(key);
+            out.push(g);
+        };
+        if (iri) {
+            for (const raw of rawNamedNodeValues(doc, predicate))
+                push(raw);
+        }
+        else {
+            const pred = doc.factory.namedNode(predicate);
+            for (const q of doc.dataset.match(doc, pred, null, null)) {
+                push(tryRead(() => mapper.as(new TermWrapper(q.object, doc.dataset, doc.factory))));
+            }
+        }
+        return out;
+    };
+    const guarded = {
+        add(value) {
+            const g = guard(value);
+            if (g !== undefined)
+                base.add(g);
+            return guarded;
+        },
+        delete(value) {
+            const g = guard(value);
+            if (g === undefined)
+                return false;
+            // Remove every stored member whose GUARDED (canonical) form matches — a
+            // non-canonical equivalent (`<http://x.org>` vs `http://x.org/`, `"01"^^integer`
+            // vs `1`, `"0.00000010"^^decimal` vs `1e-7`) is still deleted. `base.delete(g)`
+            // would serialise only the CANONICAL literal and miss the stored quad, so the
+            // raw dataset quads are scanned + compared by SameValueZero and deleted directly.
+            let deleted = false;
+            if (iri) {
+                for (const raw of rawNamedNodeValues(doc, predicate)) {
+                    if (httpIriOrUndefined(raw) === g && base.delete(raw))
+                        deleted = true;
+                }
+                return deleted;
+            }
+            const pred = doc.factory.namedNode(predicate);
+            for (const q of [...doc.dataset.match(doc, pred, null, null)]) {
+                const mapped = tryRead(() => mapper.as(new TermWrapper(q.object, doc.dataset, doc.factory)));
+                const gm = guard(mapped);
+                if (gm !== undefined && sameValueZero(gm, g)) {
+                    doc.dataset.delete(q);
+                    deleted = true;
+                }
+            }
+            return deleted;
+        },
+        has(value) {
+            const g = guard(value);
+            // `Array.includes` uses SameValueZero, so a NaN member (valid for xsd:double)
+            // matches `has(NaN)`, mirroring native `Set` semantics (unlike `===`).
+            return g !== undefined && validMembers().includes(g);
+        },
+        clear() {
+            base.clear();
+        },
+        forEach(callback, thisArg) {
+            for (const v of validMembers())
+                callback.call(thisArg, v, v, guarded);
+        },
+        keys() {
+            return validMembers()[Symbol.iterator]();
+        },
+        values() {
+            return validMembers()[Symbol.iterator]();
+        },
+        entries() {
+            return validMembers()
+                .map((v) => [v, v])[Symbol.iterator]();
+        },
+        [Symbol.iterator]() {
+            return validMembers()[Symbol.iterator]();
+        },
+        get size() {
+            return validMembers().length;
+        },
+        [Symbol.toStringTag]: "Set",
+    };
+    return guarded;
+}
+/** Whether the predicate carries at least one object quad on `doc` (raw presence). */
+function predicatePresent(doc, predicate) {
+    const pred = doc.factory.namedNode(predicate);
+    for (const _q of doc.dataset.match(doc, pred, null, null))
+        return true;
+    return false;
+}
 /** Read a single (non-set) field's value, applying read-side guards, fail-closed. */
 function readSingle(doc, plan) {
     const { field, mapper } = plan;
     const raw = tryRead(() => OptionalFrom.subjectPredicate(doc, field.predicate, mapper.as));
-    if (hasIriSchemeGuard(field)) {
-        return httpIriOrUndefined(raw);
+    // Normalise through the field's value filter — the http(s) scheme filter for an
+    // IRI field, else the datatype lexical/numeric validity — THEN the scalar guards
+    // (numeric range / string length). Both categories apply even to an IRI field
+    // that carries a scalar guard (e.g. minLength), fail-closed.
+    const normalise = (v) => hasIriSchemeGuard(field)
+        ? applyScalarGuards(field, httpIriOrUndefined(v))
+        : applyScalarGuards(field, applyDatatypeValidity(mapper, v));
+    // A configured default is applied ONLY when the predicate is genuinely ABSENT. A
+    // PRESENT value that is unreadable (the mapper threw ⇒ raw undefined) or fails
+    // normalisation reads as undefined (fail-closed) — it is NOT masked by the default,
+    // and it still triggers requiredFailClosed. The default itself is normalised too.
+    if (!predicatePresent(doc, field.predicate)) {
+        return field.default !== undefined ? normalise(field.default) : undefined;
     }
-    if (raw === undefined && field.default !== undefined)
-        return field.default;
-    return raw;
+    return normalise(raw);
 }
 /** Live set for a set field (mutations write through @rdfjs/wrapper's SetFrom). */
 function fieldSet(doc, plan) {
     const { field, mapper } = plan;
     const base = SetFrom.subjectPredicate(doc, field.predicate, mapper.as, mapper.from);
+    // A field carrying a hard value guard (numeric/lexical datatype validity, numeric
+    // range, string length, or — for an IRI field — a scalar guard on top of the scheme
+    // filter) gets the guarded set, which enforces canonicalisation + those guards on
+    // both `add` and reads. A plain IRI-scheme set (no scalar guard) keeps the lighter
+    // iri-filtered set; everything else is the raw base.
+    if (setNeedsValueGuard(field, mapper)) {
+        return makeGuardedSet(doc, field.predicate, base, field, mapper);
+    }
     if (hasIriSchemeGuard(field)) {
         return makeIriFilteredSet(doc, field.predicate, base);
     }
@@ -138,21 +369,33 @@ function writeSingle(doc, plan, value) {
     const { field, mapper } = plan;
     let v = value;
     if (field.kind === "iri") {
+        // An IRI value must be a string; the scheme filter (when present) also
+        // canonicalises. A non-string is dropped fail-closed BEFORE the scalar guards, so
+        // it can never reach NamedNodeFrom.string or slip a minLength/nonBlank guard.
         if (hasIriSchemeGuard(field))
             v = httpIriOrUndefined(v);
+        else if (typeof v !== "string")
+            v = undefined;
+        v = applyScalarGuards(field, v); // scalar guards (e.g. minLength) apply to IRI writes too
         OptionalAs.object(doc, field.predicate, v, NamedNodeFrom.string);
         return;
     }
     // Literal field: sanitize a string value; DROP a non-string value fail-closed
-    // (a mistyped value must never be coerced into garbage or throw the write).
+    // (a mistyped value must never be coerced into garbage or throw the write). A
+    // NARROWED-lexical datatype (e.g. xsd:duration) is NOT sanitized — sanitising first
+    // would silently REPAIR an invalid value (`"PT30M\u0000"` → `"PT30M"`); it is
+    // validated RAW by applyDatatypeValidity below, so an invalid input drops fail-closed.
     if (v !== undefined && mapper.jsType === "string") {
         v =
             typeof v === "string"
-                ? field.guards?.sanitizeText === false
+                ? mapper.lexicalValid !== undefined || field.guards?.sanitizeText === false
                     ? v
                     : sanitizeText(v)
                 : undefined;
     }
+    // Lexical validity (e.g. xsd:duration) + numeric-range / string-length guards.
+    v = applyDatatypeValidity(mapper, v);
+    v = applyScalarGuards(field, v);
     OptionalAs.object(doc, field.predicate, v, mapper.from);
 }
 function subjectIri(convention, resourceUrl) {
@@ -229,9 +472,16 @@ function makeEntity(entity, manifest, factory) {
                     if (field.kind === "literal" &&
                         mapper.jsType === "string" &&
                         typeof m === "string" &&
-                        field.guards?.sanitizeText !== false) {
+                        field.guards?.sanitizeText !== false &&
+                        mapper.lexicalValid === undefined // a narrowed-lexical member is validated RAW
+                    ) {
                         m = sanitizeText(m);
                     }
+                    // Datatype validity + numeric-range / string-length guards + IRI
+                    // canonicalisation are ALL applied by the guarded set's `add` (in the
+                    // correct order), so a raw member is handed straight to it — no premature
+                    // pre-canonicalisation check here (which could wrongly drop an IRI whose
+                    // canonical form would satisfy the guard).
                     set.add(m);
                 }
                 continue;

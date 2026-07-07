@@ -30,6 +30,14 @@ export interface ManifestFieldGuards {
     dropBlank?: boolean;
     /** `parse` returns a set field's members sorted (stable projection). */
     sortOnRead?: boolean;
+    /** Numeric lower bound (`sh:minInclusive`) — a number value below it is dropped. */
+    minInclusive?: number;
+    /** Numeric upper bound (`sh:maxInclusive`) — a number value above it is dropped. */
+    maxInclusive?: number;
+    /** Minimum string length (`sh:minLength`) — a shorter string value is dropped. */
+    minLength?: number;
+    /** Singleton non-blank string: a blank (whitespace-only / empty) value is dropped. */
+    nonBlank?: boolean;
 }
 /** A literal scalar a manifest may carry (default value / `sh:in` member). */
 export type ManifestScalar = string | number | boolean;

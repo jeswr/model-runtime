@@ -1,6 +1,6 @@
 {
   "name": "@jeswr/model-runtime",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "The one audited generic runtime for the federation-codegen pipeline — interprets a JSON shape-manifest to parse / validate / read / write RDF over @rdfjs/wrapper, carrying the full guard inventory the hand-written @jeswr data-model packages duplicate. Generated artifacts contain NO executable logic.",
   "type": "module",
   "license": "MIT",
