@@ -592,6 +592,101 @@ function fieldOf(m: ReturnType<typeof scrobbleManifest>, ni: number, fi: number)
   return field;
 }
 
+describe("composite parse — OPTIONAL link failure DEGRADES (drop the field, admit)", () => {
+  // The documented grading (SHACL G1 / the composite design): only a Violation-graded
+  // (requiredFailClosed) link whose resolution fails rejects the WHOLE composite; a
+  // Warning/Info (optional) link that fails to resolve — ambiguous, over the read
+  // budget, absent, or a non-conforming target — DROPS its field and admits. An
+  // otherwise-usable scrobble must not vanish over a second performedByArtist triple.
+  const fullSansArtist = { ...FULL } as Record<string, unknown>;
+  delete fullSansArtist.artistName;
+
+  it("drops the field + ADMITS on an ambiguous OPTIONAL link (>1 distinct target)", () => {
+    // Two distinct performedByArtist targets on the OPTIONAL track→artist link: the
+    // link fails as ambiguous, but ONLY the artist field is dropped — the composite
+    // (whose MUSTs are all met) is admitted. This is the solid-listening regression:
+    // the whole parse used to return undefined here.
+    const store = Scrobble.build(RES, FULL);
+    store.addQuad(
+      DataFactory.namedNode(TRACK),
+      DataFactory.namedNode(`${MEDIA}performedByArtist`),
+      DataFactory.namedNode("https://alice.pod.example/artists/other#it"),
+    );
+    expect(Scrobble.parse(RES, store)).toEqual(fullSansArtist);
+  });
+
+  it("drops the field + ADMITS when an OPTIONAL link exceeds the read budget (bounded)", () => {
+    // A hostile fan-out of NON-http objects on the optional link: no ambiguity fires,
+    // only the per-link READ BUDGET — the link fails, the field drops, the composite
+    // admits, and the scan stays bounded (the resolver's early exit is unweakened).
+    const store = Scrobble.build(RES, FULL);
+    const Fanout = 100000;
+    for (let i = 0; i < Fanout; i++) {
+      store.addQuad(
+        DataFactory.namedNode(TRACK),
+        DataFactory.namedNode(`${MEDIA}performedByArtist`),
+        DataFactory.namedNode(`urn:evil:${i}`), // NON-http ⇒ skipped, never a target
+      );
+    }
+    const s = store as unknown as {
+      readQuads: (...a: unknown[]) => Iterable<unknown>;
+    };
+    const realReadQuads = s.readQuads.bind(store);
+    let objectsRead = 0;
+    s.readQuads = function* spy(...args: unknown[]) {
+      for (const q of realReadQuads(...args)) {
+        objectsRead++;
+        yield q;
+      }
+    } as never;
+    try {
+      expect(Scrobble.parse(RES, store)).toEqual(fullSansArtist);
+    } finally {
+      s.readQuads = realReadQuads as never;
+    }
+    // Bounded: the resolver abandoned the optional link after the budget, never the
+    // full 100000-object fan-out (a degraded link must not cost unbounded reads).
+    expect(objectsRead).toBeLessThan(1000);
+  });
+
+  it("drops the field + ADMITS when an OPTIONAL link's target fails its own Violation MUST", () => {
+    // Grade artistName as a Violation MUST *within its node*, then strip it: the artist
+    // sub-node no longer conforms, so the OPTIONAL performedByArtist link fails — the
+    // field drops, the composite admits (the outer link's grade governs, not the inner).
+    const m = scrobbleManifest();
+    fieldOf(m, 3, 0).guards = { requiredFailClosed: true }; // artist.artistName
+    const S = defineModel(m).entities.Scrobble;
+    if (!S) throw new Error("expected the Scrobble composite");
+    const store = S.build(RES, FULL);
+    store.removeQuads(store.getQuads(ARTIST, `${FOAF}name`, null, null));
+    expect(S.parse(RES, store)).toEqual(fullSansArtist);
+  });
+
+  it("drops the field + ADMITS when an OPTIONAL link's target is not typed (fail-closed type)", () => {
+    const store = Scrobble.build(RES, FULL);
+    store.removeQuads(store.getQuads(ARTIST, RDF_TYPE, `${MEDIA}Artist`, null));
+    expect(Scrobble.parse(RES, store)).toEqual(fullSansArtist);
+  });
+
+  it("still REJECTS the whole composite on an ambiguous REQUIRED link", () => {
+    // The required-link fail-closed behavior is unchanged (also covered by the
+    // graph-walk suite above) — asserted here as the graded counterpart.
+    const store = Scrobble.build(RES, FULL);
+    store.addQuad(
+      DataFactory.namedNode(IT),
+      DataFactory.namedNode(`${MEDIA}playedWork`),
+      DataFactory.namedNode("https://alice.pod.example/tracks/other#it"),
+    );
+    expect(Scrobble.parse(RES, store)).toBeUndefined();
+  });
+
+  it("still REJECTS the whole composite when a REQUIRED link's target fails its MUST", () => {
+    const store = Scrobble.build(RES, FULL);
+    store.removeQuads(store.getQuads(TRACK, `${DCT}title`, null, null));
+    expect(Scrobble.parse(RES, store)).toBeUndefined();
+  });
+});
+
 describe("composite manifest validation — FAIL-CLOSED on a malformed composite", () => {
   const bad: Array<[string, (m: ReturnType<typeof scrobbleManifest>) => void]> = [
     [

@@ -84,11 +84,13 @@ field names are **globally unique** across the composite (the projection is one 
   is materialised only when its subtree carries data — no bare typed shells).
 - **`parse`** GRAPH-WALKS from the root: it follows the ACTUAL link triple (never assumes the fragment
   — an untrusted document may link anywhere), canonicalising each target IRI through the http(s) filter
-  and bounding the candidate scan. A sub-node must carry its `rdf:type` (fail-closed). A
-  `requiredFailClosed` cross-node link whose target sub-node does not conform **rejects the WHOLE
-  composite** (a titled `Track` + a valid `Instant` MUST be reachable); a Warning/Info link simply drops
-  its sub-node's fields and admits. Field names being globally unique, the sub-nodes' fields merge into
-  one flat object.
+  and bounding the candidate scan. A sub-node must carry its `rdf:type` (fail-closed). Link-resolution
+  failure — an absent or non-conforming target, an AMBIGUOUS link (>1 distinct canonical target), or an
+  over-budget fan-out — is graded by the link: a `requiredFailClosed` cross-node link **rejects the
+  WHOLE composite** (a titled `Track` + a valid `Instant` MUST be reachable); a Warning/Info (optional)
+  link simply drops its sub-node's fields and admits (an otherwise-usable document is never rejected
+  over an unresolvable optional link). Field names being globally unique, the sub-nodes' fields merge
+  into one flat object.
 
 The composite manifest is validated **fail-closed** (the tree invariant — one root, every non-root node
 exactly one incoming link, acyclic + spanning; a `nested` field carries no data-shape key and only the

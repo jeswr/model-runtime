@@ -747,7 +747,12 @@ const MAX_NODE_VISITS = 10000;
 const MAX_LINK_READS = 32;
 
 interface NestedTargetResolution {
-  /** Fail closed — the link is ambiguous (>1 distinct target) or exceeds the read budget. */
+  /**
+   * The link failed to resolve — ambiguous (>1 distinct target) or over the read budget.
+   * The DISPOSITION is graded at the call site (SHACL G1 grading): a Violation-graded
+   * (`requiredFailClosed`) link rejects the whole composite; an optional (Warning/Info)
+   * link drops its field and admits.
+   */
   readonly reject: boolean;
   /** The single canonical http(s) target, when resolved and unambiguous (else undefined). */
   readonly target?: string;
@@ -760,7 +765,9 @@ interface NestedTargetResolution {
  * canonical http(s) target is seen the link is rejected as AMBIGUOUS; and if the raw object
  * reads exceed {@link MAX_LINK_READS} before resolving, the link is rejected (a hostile
  * fan-out on one predicate must not force unbounded work). Two lexical forms of the SAME
- * canonical target are NOT ambiguous (they resolve to one target).
+ * canonical target are NOT ambiguous (they resolve to one target). How a rejected link
+ * affects the composite is decided by the CALLER per the link's grade (see
+ * {@link NestedTargetResolution.reject}) — the resolver only reports the link failure.
  */
 function resolveNestedTarget(doc: TermWrapper, predicate: string): NestedTargetResolution {
   const pred = doc.factory.namedNode(predicate);
@@ -865,15 +872,24 @@ function makeCompositeEntity(
         // the fragment convention — an untrusted document may link anywhere). A nested
         // link is SINGLE-VALUED (maxCount 1 by construction — set-valued links are a
         // documented future feature); the bounded resolver streams the objects and FAILS
-        // CLOSED on ambiguity (>1 distinct target) OR an over-budget fan-out, without
-        // materialising the full candidate list. Either rejects the WHOLE composite.
+        // the LINK on ambiguity (>1 distinct target) OR an over-budget fan-out, without
+        // materialising the full candidate list.
+        //
+        // DISPOSITION of any link-resolution failure is graded by the link's SHACL G1
+        // grade: a Violation-graded (requiredFailClosed) link rejects the WHOLE
+        // composite; a Warning/Info (optional) link DEGRADES — its field is dropped and
+        // the composite admitted (an otherwise-usable document is never rejected over an
+        // unresolvable optional link). The resolver's bounds themselves are unchanged.
         const link = resolveNestedTarget(doc, nf.predicate);
-        if (link.reject) return undefined;
+        if (link.reject) {
+          if (required) return undefined;
+          continue;
+        }
         const childData = link.target !== undefined ? parseNode(child, link.target) : undefined;
         if (childData === undefined) {
-          // A Violation-graded (requiredFailClosed) cross-node MUST whose single target
-          // is absent or non-conforming rejects the WHOLE composite. A Warning/Info link
-          // drops its sub-node's fields and admits.
+          // Same grading: a Violation-graded cross-node MUST whose single target is
+          // absent or non-conforming (fails its own guards / type check) rejects the
+          // WHOLE composite. A Warning/Info link drops its sub-node's fields and admits.
           if (required) return undefined;
           continue;
         }
