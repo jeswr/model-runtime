@@ -168,6 +168,122 @@ function floatingAs(datatypeIri) {
         return n;
     };
 }
+/** Days in a (1-based) month, honouring leap years (for XSD calendar validity). */
+function daysInMonth(year, month) {
+    if (month === 2) {
+        const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+        return leap ? 29 : 28;
+    }
+    return [4, 6, 9, 11].includes(month) ? 30 : 31;
+}
+// XSD lexical structure. Year is 4+ digits (optionally negative); month/day/hour/
+// minute/second are exactly two digits; fractional seconds optional; timezone is
+// `Z` or `±HH:MM`. Semantic (calendar / range) validity is checked separately.
+const XSD_DATETIME_RE = /^(-?\d{4,})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})?$/;
+const XSD_DATE_RE = /^(-?\d{4,})-(\d{2})-(\d{2})(Z|[+-]\d{2}:\d{2})?$/;
+/** True for a legal `±HH:MM` / `Z` timezone designator (|offset| ≤ 14:00). */
+function timezoneValid(tz) {
+    if (tz === undefined || tz === "Z")
+        return true;
+    const h = Number(tz.slice(1, 3));
+    const m = Number(tz.slice(4, 6));
+    if (m > 59)
+        return false;
+    return h < 14 || (h === 14 && m === 0);
+}
+/**
+ * True for a lexically-valid `xsd:dateTime` (XSD 1.1), including CALENDAR validity
+ * (month 1–12, day within the month, leap years) and the `24:00:00` end-of-day
+ * form (hour 24 requires zero minutes/seconds). JS `new Date(...)` alone is NOT a
+ * validator: V8 ROLLS OVER an out-of-range day (`2020-02-30` ⇒ Mar 1 — a silently
+ * WRONG value) and accepts non-XSD prose like `"January 1 2020"`.
+ */
+export function isXsdDateTime(value) {
+    const m = XSD_DATETIME_RE.exec(value);
+    if (m === null)
+        return false;
+    const [, year, month, day, hour, minute, second, fraction, tz] = m;
+    const mo = Number(month);
+    const d = Number(day);
+    if (mo < 1 || mo > 12)
+        return false;
+    if (d < 1 || d > daysInMonth(Number(year), mo))
+        return false;
+    const h = Number(hour);
+    const mi = Number(minute);
+    const s = Number(second);
+    if (h === 24) {
+        // XSD permits 24:00:00 (the following midnight) with zero minutes/seconds only.
+        if (mi !== 0 || s !== 0)
+            return false;
+        if (fraction !== undefined && Number(fraction) !== 0)
+            return false;
+    }
+    else if (h > 23)
+        return false;
+    if (mi > 59 || s > 59)
+        return false; // XSD has no leap seconds
+    return timezoneValid(tz);
+}
+/** True for a lexically-valid `xsd:date` (XSD 1.1) — calendar-checked like dateTime. */
+export function isXsdDate(value) {
+    const m = XSD_DATE_RE.exec(value);
+    if (m === null)
+        return false;
+    const [, year, month, day, tz] = m;
+    const mo = Number(month);
+    const d = Number(day);
+    if (mo < 1 || mo > 12)
+        return false;
+    if (d < 1 || d > daysInMonth(Number(year), mo))
+        return false;
+    return timezoneValid(tz);
+}
+/**
+ * A datatype-EXACT, lexically-validated reader for `xsd:dateTime` / `xsd:date` —
+ * the date counterpart of {@link floatingAs}. The term must be a `Literal` typed
+ * EXACTLY the field's declared datatype (an `xsd:date` literal does not surface
+ * through a dateTime field, nor a look-alike `xsd:string`), its lexical form must
+ * be XSD-valid ({@link isXsdDateTime} / {@link isXsdDate} — so a rolled-over
+ * `2020-02-30` or JS-prose `"January 1 2020"` never surfaces a WRONG `Date`), and
+ * the parsed `Date` must be time-valid. Any failure THROWS, so the read drops the
+ * field fail-closed (`tryRead`) instead of surfacing an `Invalid Date` — aligning
+ * malformed dateTime literals with every other malformed-literal drop; the field's
+ * `requiredFailClosed` grading then decides admit/reject as usual.
+ *
+ * A lexically-valid value JS `Date` cannot represent (a negative/far year, or an
+ * offset-timezoned `xsd:date`, which V8 refuses to parse) also drops fail-closed:
+ * `Date` is the surface type, and a value it cannot faithfully carry must never
+ * surface as `Invalid Date`.
+ */
+function dateAs(datatypeIri) {
+    const lexicalValid = datatypeIri === `${XSD}date` ? isXsdDate : isXsdDateTime;
+    return (term) => {
+        const t = term;
+        if (t.termType !== "Literal")
+            throw new Error("date/dateTime: term is not a Literal");
+        if (t.datatype?.value !== datatypeIri) {
+            throw new Error("date/dateTime: term datatype does not match the field datatype");
+        }
+        if (!lexicalValid(t.value))
+            throw new Error("date/dateTime: invalid XSD lexical");
+        const d = new Date(t.value);
+        if (!Number.isFinite(d.getTime())) {
+            throw new Error("date/dateTime: value not representable as a JS Date");
+        }
+        return d;
+    };
+}
+/**
+ * A datatype-preserving `from` for `xsd:date`: writes the UTC calendar date
+ * (`YYYY-MM-DDZ`) — a VALID `xsd:date` lexical. `LiteralFrom.date` writes the full
+ * `toISOString()` dateTime lexical tagged `xsd:date`, which is not in `xsd:date`'s
+ * lexical space and would (correctly) fail the strict read-back. Time-of-day is
+ * dropped — inherent to `xsd:date`'s value space.
+ */
+function dateFrom(value, factory) {
+    return factory.literal(`${value.toISOString().slice(0, 10)}Z`, factory.namedNode(`${XSD}date`));
+}
 /** The largest finite magnitude representable as an IEEE-754 single (`xsd:float`). */
 const XSD_FLOAT_MAX = 3.4028234663852886e38;
 /** `xsd:float` value space: NaN / ±INF, or a finite value within the float32 range. */
@@ -208,9 +324,22 @@ export function literalMapper(datatypeIri) {
         case `${XSD}boolean`:
             return { as: LiteralAs.boolean, from: LiteralFrom.boolean, jsType: "boolean" };
         case `${XSD}dateTime`:
-            return { as: LiteralAs.date, from: LiteralFrom.dateTime, jsType: "date" };
+            // Datatype-CHECKED + XSD-lexically-validated read (a malformed literal DROPS
+            // fail-closed via tryRead — never an `Invalid Date`); write via toISOString.
+            return {
+                as: dateAs(iri),
+                from: LiteralFrom.dateTime,
+                jsType: "date",
+            };
         case `${XSD}date`:
-            return { as: LiteralAs.date, from: LiteralFrom.date, jsType: "date" };
+            // Same strict read; the write emits a valid `YYYY-MM-DDZ` xsd:date lexical
+            // (LiteralFrom.date would emit a full dateTime lexical, outside xsd:date's
+            // lexical space).
+            return {
+                as: dateAs(iri),
+                from: dateFrom,
+                jsType: "date",
+            };
         case `${XSD}integer`:
         case `${XSD}int`:
         case `${XSD}long`:

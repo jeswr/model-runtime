@@ -114,8 +114,13 @@ function hasIriSchemeGuard(field: ManifestField): boolean {
   return field.kind === "iri" && field.guards?.iriScheme === "http-https";
 }
 
-/** SameValueZero equality (native `Set` semantics: NaN matches NaN; +0 matches -0). */
+/**
+ * SameValueZero equality (native `Set` semantics: NaN matches NaN; +0 matches -0),
+ * extended with `Date` VALUE equality: every read mints a fresh `Date` object, so
+ * identity comparison would make `delete(date)` on a dateTime set always miss.
+ */
 function sameValueZero(a: unknown, b: unknown): boolean {
+  if (a instanceof Date && b instanceof Date) return a.getTime() === b.getTime();
   return (
     a === b ||
     (typeof a === "number" && typeof b === "number" && Number.isNaN(a) && Number.isNaN(b))
@@ -171,6 +176,13 @@ function applyDatatypeValidity(mapper: DatatypeMapper, value: unknown): unknown 
     // an xsd:duration set) is dropped fail-closed rather than reaching the serializer.
     if (typeof value !== "string") return undefined;
     if (mapper.lexicalValid && !mapper.lexicalValid(value)) return undefined;
+    return value;
+  }
+  if (mapper.jsType === "date") {
+    // A date field requires a TIME-VALID `Date` — a non-Date, or an `Invalid Date`
+    // (whose `toISOString()` would throw the write, and which must never surface on
+    // read), is dropped fail-closed like every other malformed value.
+    if (!(value instanceof Date) || !Number.isFinite(value.getTime())) return undefined;
     return value;
   }
   return value;
@@ -288,8 +300,10 @@ function setNeedsValueGuard(field: ManifestField, mapper: DatatypeMapper): boole
   // EVERY numeric field needs the guarded set: applyDatatypeValidity enforces the
   // finite-number / value-space check on the live `add` for ALL numeric datatypes
   // (incl. decimal/double/float, which have no numericValid but still must reject a
-  // non-number member), matching the singleton + build-time set write paths.
-  if (mapper.jsType === "number") return true;
+  // non-number member), matching the singleton + build-time set write paths. Every
+  // DATE field does too: a non-Date / Invalid-Date member must drop on `add` (its
+  // toISOString would throw the write), and a malformed stored literal on read.
+  if (mapper.jsType === "number" || mapper.jsType === "date") return true;
   if (mapper.lexicalValid !== undefined || mapper.numericValid !== undefined) return true;
   const g = field.guards;
   return (
@@ -337,7 +351,9 @@ function makeGuardedSet(
     const push = (mapped: unknown) => {
       const g = guard(mapped);
       if (g === undefined) return;
-      const key = String(g);
+      // Dedup by VALUE. `String(date)` drops milliseconds (two distinct instants in
+      // the same second would wrongly dedup), so a Date keys by its ISO instant.
+      const key = g instanceof Date ? g.toISOString() : String(g);
       if (seen.has(key)) return;
       seen.add(key);
       out.push(g);

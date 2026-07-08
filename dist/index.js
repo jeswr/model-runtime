@@ -18,7 +18,7 @@
  *
  * @packageDocumentation
  */
-export { expandDatatype, iriMapper, isKnownDatatype, isXsdDuration, literalMapper, XSD, } from "./datatypes.js";
+export { expandDatatype, iriMapper, isKnownDatatype, isXsdDate, isXsdDateTime, isXsdDuration, literalMapper, XSD, } from "./datatypes.js";
 export { httpIriOrUndefined, isHttpIri, sanitizeText, tryRead, } from "./guards.js";
 export { isCompositeEntity, MANIFEST_VERSION, ManifestError, RUNTIME_MAJOR, validateManifest, } from "./manifest.js";
 export { defineModel, } from "./model.js";

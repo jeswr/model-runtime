@@ -50,6 +50,16 @@ export declare function isXsdDuration(value: string): boolean;
  */
 export declare function toPlainDecimalString(value: number): string;
 /**
+ * True for a lexically-valid `xsd:dateTime` (XSD 1.1), including CALENDAR validity
+ * (month 1–12, day within the month, leap years) and the `24:00:00` end-of-day
+ * form (hour 24 requires zero minutes/seconds). JS `new Date(...)` alone is NOT a
+ * validator: V8 ROLLS OVER an out-of-range day (`2020-02-30` ⇒ Mar 1 — a silently
+ * WRONG value) and accepts non-XSD prose like `"January 1 2020"`.
+ */
+export declare function isXsdDateTime(value: string): boolean;
+/** True for a lexically-valid `xsd:date` (XSD 1.1) — calendar-checked like dateTime. */
+export declare function isXsdDate(value: string): boolean;
+/**
  * Resolve a full datatype IRI (or an `xsd:` shorthand) to a mapper pair for a
  * LITERAL field. Unknown datatypes fall back to the safe string mapping (the
  * value is carried as an opaque string literal) rather than throwing, so an
