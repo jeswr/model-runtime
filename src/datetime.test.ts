@@ -253,6 +253,111 @@ describe("dateTime SET field — malformed members drop; valid members round-tri
   });
 });
 
+describe("dateTime SET — has()/delete() agree by VALUE (never object identity)", () => {
+  const freshSet = (): Set<Date> => {
+    const store = new Store();
+    const doc = new Event_.Wrapper(SUBJ, store, DataFactory).mark();
+    return (doc as unknown as { occurrences: Set<Date> }).occurrences;
+  };
+
+  it("has() matches an equal-but-different Date instance, consistently with delete()", () => {
+    const set = freshSet();
+    set.add(new Date("2021-05-05T05:05:05.000Z"));
+    // An EQUAL instant in a DIFFERENT object: `Array.includes` (object identity)
+    // reported false here while `delete` of the same value succeeded.
+    const probe = new Date("2021-05-05T05:05:05.000Z");
+    expect(set.has(probe)).toBe(true);
+    expect(set.delete(probe)).toBe(true);
+    expect(set.has(probe)).toBe(false);
+    expect(set.size).toBe(0);
+  });
+
+  it("has() and delete() give the SAME verdict for any probe (hit and miss)", () => {
+    const set = freshSet();
+    set.add(new Date("2021-05-05T05:05:05.100Z"));
+    for (const lexical of ["2021-05-05T05:05:05.100Z", "2021-05-05T05:05:05.200Z"]) {
+      const seen = set.has(new Date(lexical));
+      const removed = set.delete(new Date(lexical));
+      expect(removed).toBe(seen); // never has=false while delete=true (or vice versa)
+    }
+  });
+
+  it("has() still distinguishes instants a millisecond apart", () => {
+    const set = freshSet();
+    set.add(new Date("2021-05-05T05:05:05.100Z"));
+    expect(set.has(new Date("2021-05-05T05:05:05.200Z"))).toBe(false);
+    expect(set.has(new Date("2021-05-05T05:05:05.100Z"))).toBe(true);
+  });
+});
+
+/** A Date pinned to a UTC calendar date, safe for years JS `Date.UTC` mis-maps (0–99). */
+function utcDate(year: number, month1: number, day: number): Date {
+  const d = new Date(0);
+  d.setUTCFullYear(year, month1 - 1, day);
+  d.setUTCHours(0, 0, 0, 0);
+  return d;
+}
+
+describe("xsd:date write — expanded/negative-year Dates emit a VALID lexical", () => {
+  const dayLexical = (store: Store) =>
+    store.getQuads(SUBJ, `${EX}day`, null, null)[0]?.object.value;
+
+  it("year 100000 writes '100000-01-01Z' and round-trips exactly", () => {
+    const far = utcDate(100000, 1, 1);
+    const store = Event_.build(RES, { when: WHEN, day: far });
+    expect(dayLexical(store)).toBe("100000-01-01Z");
+    expect(isXsdDate("100000-01-01Z")).toBe(true);
+    expect(Event_.parse(RES, store)?.day).toEqual(far);
+  });
+
+  it("year 275759 (near the Date range max) writes valid — never '+275759-06Z'", () => {
+    const d = utcDate(275759, 6, 5);
+    const store = Event_.build(RES, { when: WHEN, day: d });
+    expect(dayLexical(store)).toBe("275759-06-05Z");
+    expect(isXsdDate("275759-06-05Z")).toBe(true);
+    expect(Event_.parse(RES, store)?.day).toEqual(d);
+  });
+
+  it("year -1 writes '-0001-01-01Z' (valid XSD); the strict read drops it fail-closed", () => {
+    const store = Event_.build(RES, { when: WHEN, day: utcDate(-1, 1, 1) });
+    expect(dayLexical(store)).toBe("-0001-01-01Z");
+    expect(isXsdDate("-0001-01-01Z")).toBe(true);
+    // V8 re-parses "-0001-01-01Z" as 2001-01-01 (the two-digit-year rule) — the
+    // reader must DROP the unfaithful carry, never surface the wrong Date.
+    expect(Event_.parse(RES, store)?.day).toBeUndefined();
+  });
+
+  it("year 0 writes '0000-01-01Z' (valid XSD 1.1); the strict read drops it fail-closed", () => {
+    const store = Event_.build(RES, { when: WHEN, day: utcDate(0, 1, 1) });
+    expect(dayLexical(store)).toBe("0000-01-01Z");
+    expect(isXsdDate("0000-01-01Z")).toBe(true);
+    expect(Event_.parse(RES, store)?.day).toBeUndefined(); // V8 ⇒ 2000-01-01, dropped
+  });
+});
+
+describe("xsd:date read — a V8-MISPARSED valid lexical drops fail-closed (never a wrong Date)", () => {
+  for (const [lexical, misparse] of [
+    ["0000-01-01Z", "2000-01-01"],
+    ["-0001-01-01Z", "2001-01-01"],
+  ] as const) {
+    it(`"${lexical}" (V8 silently misparses it to ${misparse}) drops`, () => {
+      const store = storeWith([
+        { predicate: `${EX}when`, lexical: "2020-01-01T12:00:00Z" },
+        { predicate: `${EX}day`, lexical, datatype: `${XSD}date` },
+      ]);
+      expect(Event_.parse(RES, store)?.day).toBeUndefined();
+    });
+  }
+
+  it('"100000-01-01Z" (V8 parses it faithfully) reads the expanded-year date', () => {
+    const store = storeWith([
+      { predicate: `${EX}when`, lexical: "2020-01-01T12:00:00Z" },
+      { predicate: `${EX}day`, lexical: "100000-01-01Z", datatype: `${XSD}date` },
+    ]);
+    expect(Event_.parse(RES, store)?.day).toEqual(utcDate(100000, 1, 1));
+  });
+});
+
 // ——— Composite grading: the solid-listening playedAt shape ———
 
 const TIME = "http://www.w3.org/2006/time#";

@@ -324,9 +324,12 @@ function makeGuardedSet(doc, predicate, base, field, mapper) {
         },
         has(value) {
             const g = guard(value);
-            // `Array.includes` uses SameValueZero, so a NaN member (valid for xsd:double)
-            // matches `has(NaN)`, mirroring native `Set` semantics (unlike `===`).
-            return g !== undefined && validMembers().includes(g);
+            // Membership by the SAME equality `delete` uses ({@link sameValueZero}: a NaN
+            // member matches `has(NaN)` like a native `Set`, and a `Date` compares by
+            // INSTANT) — every read mints a fresh `Date` object, so `Array.includes`
+            // (object identity for Dates) would report `false` for the very member that
+            // `delete(sameInstant)` removes, making has/delete inconsistent.
+            return g !== undefined && validMembers().some((m) => sameValueZero(m, g));
         },
         clear() {
             base.clear();

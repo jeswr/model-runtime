@@ -285,7 +285,8 @@ export function isXsdDate(value: string): boolean {
  * surface as `Invalid Date`.
  */
 function dateAs(datatypeIri: string): (term: TermWrapper) => Date {
-  const lexicalValid = datatypeIri === `${XSD}date` ? isXsdDate : isXsdDateTime;
+  const isDate = datatypeIri === `${XSD}date`;
+  const lexicalValid = isDate ? isXsdDate : isXsdDateTime;
   return (term) => {
     const t = term as unknown as { termType: string; value: string; datatype?: { value: string } };
     if (t.termType !== "Literal") throw new Error("date/dateTime: term is not a Literal");
@@ -297,19 +298,60 @@ function dateAs(datatypeIri: string): (term: TermWrapper) => Date {
     if (!Number.isFinite(d.getTime())) {
       throw new Error("date/dateTime: value not representable as a JS Date");
     }
+    if (isDate) {
+      // V8's lenient parser can MISPARSE (not refuse) a lexically-valid date-only
+      // form — `"0000-01-01Z"` ⇒ 2000-01-01 and `"-0001-01-01Z"` ⇒ 2001-01-01 (the
+      // two-digit-year rule reached through the `Z` suffix) — a silently WRONG
+      // value, the exact failure this reader exists to prevent. Cross-check the
+      // parsed Date's UTC calendar date against the lexical's own fields; any
+      // disagreement (or a non-UTC offset an engine someday accepts — the UTC
+      // fields would not be the lexical's calendar date) drops fail-closed.
+      const m = XSD_DATE_RE.exec(t.value);
+      const tz = m?.[4];
+      if (
+        m === null ||
+        (tz !== undefined && tz !== "Z") ||
+        d.getUTCFullYear() !== Number(m[1]) ||
+        d.getUTCMonth() + 1 !== Number(m[2]) ||
+        d.getUTCDate() !== Number(m[3])
+      ) {
+        throw new Error("date: parsed Date does not match the xsd:date lexical");
+      }
+    }
     return d;
   };
 }
 
 /**
+ * The UTC calendar-date fields of a time-valid `Date` as an XSD-form lexical
+ * (`year-MM-DD`): the year is `-`-signed and padded to four digits (a wider year
+ * carries its digits unpadded — XSD prohibits both a `+` sign and leading zeros
+ * beyond four digits). `toISOString()` is NOT usable here: for an expanded or
+ * negative year it emits the ECMAScript `±YYYYYY` form (`+275759-…`/`-000001-…`),
+ * which is outside XSD's lexical space.
+ */
+function utcDateLexical(value: Date): string {
+  const y = value.getUTCFullYear();
+  const year = `${y < 0 ? "-" : ""}${String(Math.abs(y)).padStart(4, "0")}`;
+  const month = String(value.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(value.getUTCDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+/**
  * A datatype-preserving `from` for `xsd:date`: writes the UTC calendar date
- * (`YYYY-MM-DDZ`) — a VALID `xsd:date` lexical. `LiteralFrom.date` writes the full
- * `toISOString()` dateTime lexical tagged `xsd:date`, which is not in `xsd:date`'s
- * lexical space and would (correctly) fail the strict read-back. Time-of-day is
- * dropped — inherent to `xsd:date`'s value space.
+ * (`YYYY-MM-DDZ`) — a VALID `xsd:date` lexical for EVERY time-valid `Date`,
+ * including expanded (`100000-01-01Z`) and negative (`-0001-01-01Z`) years, which
+ * a naive `toISOString().slice(0, 10)` truncates into a MALFORMED `+275759-06Z`.
+ * (`LiteralFrom.date` writes the full `toISOString()` dateTime lexical tagged
+ * `xsd:date`, which is not in `xsd:date`'s lexical space and would (correctly)
+ * fail the strict read-back.) Time-of-day is dropped — inherent to `xsd:date`'s
+ * value space. A year-0 / negative-year lexical is written VALID but V8 cannot
+ * faithfully re-parse it — the strict reader drops it fail-closed (see
+ * {@link dateAs}) rather than surfacing a wrong value.
  */
 function dateFrom(value: Date, factory: DataFactory): Term {
-  return factory.literal(`${value.toISOString().slice(0, 10)}Z`, factory.namedNode(`${XSD}date`));
+  return factory.literal(`${utcDateLexical(value)}Z`, factory.namedNode(`${XSD}date`));
 }
 
 /** The largest finite magnitude representable as an IEEE-754 single (`xsd:float`). */
