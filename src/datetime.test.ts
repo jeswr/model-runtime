@@ -358,6 +358,80 @@ describe("xsd:date read — a V8-MISPARSED valid lexical drops fail-closed (neve
   });
 });
 
+/** A Date pinned to a UTC instant, safe for years JS `Date.UTC` mis-maps (0–99). */
+function utcDateTime(
+  year: number,
+  month1: number,
+  day: number,
+  hour = 0,
+  minute = 0,
+  second = 0,
+  ms = 0,
+): Date {
+  const d = new Date(0);
+  d.setUTCFullYear(year, month1 - 1, day);
+  d.setUTCHours(hour, minute, second, ms);
+  return d;
+}
+
+describe("xsd:dateTime write — expanded/negative-year Dates emit a VALID lexical", () => {
+  const seenLexical = (store: Store) =>
+    store.getQuads(SUBJ, `${EX}seen`, null, null)[0]?.object.value;
+
+  it("a normal 2026 dateTime writes '2026-…T…Z' (byte-identical to toISOString) and round-trips", () => {
+    const d = new Date("2026-07-11T10:20:30.400Z");
+    const store = Event_.build(RES, { when: WHEN, seen: d });
+    expect(seenLexical(store)).toBe("2026-07-11T10:20:30.400Z");
+    expect(isXsdDateTime("2026-07-11T10:20:30.400Z")).toBe(true);
+    expect(Event_.parse(RES, store)?.seen).toEqual(d);
+  });
+
+  it("year 100000 writes '100000-01-01T12:30:05.250Z' — never the '+100000-…' ECMAScript form", () => {
+    const far = utcDateTime(100000, 1, 1, 12, 30, 5, 250);
+    const store = Event_.build(RES, { when: WHEN, seen: far });
+    expect(seenLexical(store)).toBe("100000-01-01T12:30:05.250Z");
+    expect(isXsdDateTime("100000-01-01T12:30:05.250Z")).toBe(true);
+    // V8 REFUSES the XSD expanded-year dateTime form (`Invalid Date` — unlike the
+    // date-only form, which it parses faithfully) — the strict read drops it
+    // fail-closed rather than surfacing a wrong value.
+    expect(Event_.parse(RES, store)?.seen).toBeUndefined();
+  });
+
+  it("year 275760 (the Date range max) writes valid — never '+275760-09-13T00:00:00.000Z'", () => {
+    const max = new Date(8.64e15); // the largest representable Date
+    const store = Event_.build(RES, { when: WHEN, seen: max });
+    expect(seenLexical(store)).toBe("275760-09-13T00:00:00.000Z");
+    expect(isXsdDateTime("275760-09-13T00:00:00.000Z")).toBe(true);
+    expect(Event_.parse(RES, store)?.seen).toBeUndefined(); // V8 refuses; fail-closed drop
+  });
+
+  it("year -1 writes '-0001-…' (XSD form) — never the '-000001-…' six-digit form XSD prohibits", () => {
+    const store = Event_.build(RES, { when: WHEN, seen: utcDateTime(-1, 1, 1) });
+    expect(seenLexical(store)).toBe("-0001-01-01T00:00:00.000Z");
+    expect(isXsdDateTime("-0001-01-01T00:00:00.000Z")).toBe(true);
+    // V8 refuses "-0001-…T…Z" (Invalid Date) — dropped fail-closed, never a wrong Date.
+    expect(Event_.parse(RES, store)?.seen).toBeUndefined();
+  });
+
+  it("year 0 writes '0000-01-01T00:00:00.000Z' and (unlike xsd:date) round-trips exactly", () => {
+    const d = utcDateTime(0, 1, 1);
+    const store = Event_.build(RES, { when: WHEN, seen: d });
+    expect(seenLexical(store)).toBe("0000-01-01T00:00:00.000Z");
+    expect(isXsdDateTime("0000-01-01T00:00:00.000Z")).toBe(true);
+    // The ISO 4-digit year-0 dateTime T-form parses FAITHFULLY in V8 (the date-only
+    // "0000-01-01Z" misparse does not reach it).
+    expect(Event_.parse(RES, store)?.seen).toEqual(d);
+  });
+
+  it("an OLD-form '-000001-…T…Z' literal already in a store still READS (backward compat)", () => {
+    const store = storeWith([
+      { predicate: `${EX}when`, lexical: "2020-01-01T12:00:00Z" },
+      { predicate: `${EX}seen`, lexical: "-000001-01-01T00:00:00.000Z" },
+    ]);
+    expect(Event_.parse(RES, store)?.seen).toEqual(utcDateTime(-1, 1, 1));
+  });
+});
+
 // ——— Composite grading: the solid-listening playedAt shape ———
 
 const TIME = "http://www.w3.org/2006/time#";

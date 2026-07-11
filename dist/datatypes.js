@@ -323,6 +323,29 @@ function utcDateLexical(value) {
 function dateFrom(value, factory) {
     return factory.literal(`${utcDateLexical(value)}Z`, factory.namedNode(`${XSD}date`));
 }
+/**
+ * A datatype-preserving `from` for `xsd:dateTime`: writes the UTC instant
+ * (`year-MM-DDTHH:MM:SS.mmmZ`, the year in XSD form via {@link utcDateLexical}) — a
+ * VALID `xsd:dateTime` lexical for EVERY time-valid `Date`. `LiteralFrom.dateTime`
+ * (a bare `toISOString()`) emits the ECMAScript expanded-year form for a wide or
+ * negative year: `+275760-09-13T00:00:00.000Z` (`+`-signed — outside XSD's lexical
+ * space, so the strict read-back rejected a value the write itself produced) and
+ * `-000001-…` (a six-digit zero-padded year — XSD prohibits leading zeros beyond
+ * four digits; it round-tripped only by riding V8's own leniency, and a conforming
+ * XSD consumer rejects it). Years 0–9999 serialize byte-identically to
+ * `toISOString()`. As with `xsd:date`, an expanded/negative-year lexical is written
+ * VALID but V8 cannot faithfully re-parse the XSD dateTime form (it REFUSES —
+ * `new Date("100000-01-01T…Z")` is an `Invalid Date`, never a misparse) — the
+ * strict reader drops it fail-closed (see {@link dateAs}) rather than surfacing a
+ * wrong value; an old-form `-000001-…` literal already in a store still reads.
+ */
+function dateTimeFrom(value, factory) {
+    const hours = String(value.getUTCHours()).padStart(2, "0");
+    const minutes = String(value.getUTCMinutes()).padStart(2, "0");
+    const seconds = String(value.getUTCSeconds()).padStart(2, "0");
+    const millis = String(value.getUTCMilliseconds()).padStart(3, "0");
+    return factory.literal(`${utcDateLexical(value)}T${hours}:${minutes}:${seconds}.${millis}Z`, factory.namedNode(`${XSD}dateTime`));
+}
 /** The largest finite magnitude representable as an IEEE-754 single (`xsd:float`). */
 const XSD_FLOAT_MAX = 3.4028234663852886e38;
 /** `xsd:float` value space: NaN / ±INF, or a finite value within the float32 range. */
@@ -364,10 +387,12 @@ export function literalMapper(datatypeIri) {
             return { as: LiteralAs.boolean, from: LiteralFrom.boolean, jsType: "boolean" };
         case `${XSD}dateTime`:
             // Datatype-CHECKED + XSD-lexically-validated read (a malformed literal DROPS
-            // fail-closed via tryRead — never an `Invalid Date`); write via toISOString.
+            // fail-closed via tryRead — never an `Invalid Date`); the write emits a valid
+            // xsd:dateTime lexical for EVERY time-valid Date (LiteralFrom.dateTime's bare
+            // toISOString emits the malformed `+`-signed ECMAScript expanded-year form).
             return {
                 as: dateAs(iri),
-                from: LiteralFrom.dateTime,
+                from: dateTimeFrom,
                 jsType: "date",
             };
         case `${XSD}date`:
